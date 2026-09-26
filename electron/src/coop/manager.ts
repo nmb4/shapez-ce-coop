@@ -32,12 +32,23 @@ export class CoopHostManager {
             this.server.broadcast(text, peer.id);
         };
         this.server.onPeersChanged = peers => {
-            this.window?.webContents.send("coop-peer-count", peers);
+            this.notifyPeers(peers);
         };
     }
 
-    setWindow(window: BrowserWindow): void {
+    setWindow(window: BrowserWindow | null): void {
         this.window = window;
+    }
+
+    private notifyPeers(peers: number): void {
+        try {
+            const contents = this.window?.webContents;
+            if (contents && !contents.isDestroyed()) {
+                contents.send("coop-peer-count", peers);
+            }
+        } catch {
+            // Window gone; relay keeps running headless
+        }
     }
 
     async start(port: number = COOP_DEFAULT_PORT): Promise<CoopStatus> {
@@ -58,7 +69,7 @@ export class CoopHostManager {
         }
         await this.server.stop();
         this.port = 0;
-        this.window?.webContents.send("coop-peer-count", 0);
+        this.notifyPeers(0);
         return this.status();
     }
 

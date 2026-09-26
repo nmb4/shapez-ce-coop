@@ -17,7 +17,12 @@ export class IpcHandler {
         ipcMain.handle("fs-job", this.handleFsJob.bind(this));
         ipcMain.handle("get-mods", this.getMods.bind(this));
         ipcMain.handle("set-fullscreen", this.setFullscreen.bind(this, window));
-        ipcMain.handle("coop-start", (_event: IpcMainInvokeEvent, port: number) => this.coop.start(port));
+        ipcMain.handle("coop-start", (_event: IpcMainInvokeEvent, port: number) => {
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                throw new RangeError("coop-start: invalid port " + String(port));
+            }
+            return this.coop.start(port);
+        });
         ipcMain.handle("coop-stop", (): Promise<CoopStatus> => this.coop.stop());
         ipcMain.handle("coop-status", (): CoopStatus => this.coop.status());
 

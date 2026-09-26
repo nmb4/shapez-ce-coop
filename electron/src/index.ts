@@ -43,6 +43,13 @@ function createWindow() {
 
     win = window;
 
+    window.on("closed", () => {
+        coopHost.setWindow(null);
+        if (win === window) {
+            win = null;
+        }
+    });
+
     if (!switches.dev) {
         window.removeMenu();
     }

@@ -5,6 +5,10 @@ import { Duplex } from "node:stream";
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // Full-state join dumps can be several MB of JSON; stay generous but bounded.
 const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+// Absolute cap on buffered-but-unparsed bytes per peer (slow-loris guard).
+const MAX_BUFFERED_BYTES = MAX_MESSAGE_BYTES + 1024 * 1024;
+// Max concurrent relay peers (host + 7 clients matches the UID slot count).
+export const MAX_PEERS = 8;
 
 // RFC 6455 opcodes we care about
 const OP_CONT = 0x0;
@@ -47,16 +51,12 @@ export class CoopWsPeer {
     onMessage: ((peer: CoopWsPeer, text: string) => void) | null = null;
     onClose: ((peer: CoopWsPeer) => void) | null = null;
 
-    constructor(id: number, socket: Duplex, head: Buffer) {
+    constructor(id: number, socket: Duplex) {
         this.id = id;
         this.socket = socket;
         this.socket.on("data", data => this.onData(data));
         this.socket.on("close", () => this.handleClose());
         this.socket.on("error", () => this.handleClose());
-        if (head.length > 0) {
-            // The HTTP parser may already have read WebSocket bytes
-            this.onData(head);
-        }
     }
 
     sendText(text: string): void {
@@ -71,11 +71,25 @@ export class CoopWsPeer {
             return;
         }
         try {
-            this.socket.write(buildFrame(Buffer.alloc(0), OP_CLOSE));
+            // Graceful close: FIN follows the close frame so well-behaved
+            // peers actually observe it. write()+destroy() risks discarding
+            // the frame and leaving the peer unaware.
+            this.socket.end(buildFrame(Buffer.alloc(0), OP_CLOSE));
+            const sock = this.socket;
+            setTimeout(() => {
+                try {
+                    sock.destroy();
+                } catch {
+                    // Already gone
+                }
+            }, 1000).unref?.();
         } catch {
-            // Ignore write errors during close
+            try {
+                this.socket.destroy();
+            } catch {
+                // Already gone
+            }
         }
-        this.socket.destroy();
         this.handleClose();
     }
 
@@ -87,8 +101,24 @@ export class CoopWsPeer {
         this.onClose?.(this);
     }
 
+    isClosed(): boolean {
+        return this.closed;
+    }
+
+    /** Feed bytes that arrived with the HTTP upgrade (after handlers attach). */
+    feedInitialData(head: Buffer): void {
+        if (head.length > 0) {
+            this.onData(head);
+        }
+    }
+
     private onData(data: Buffer): void {
         this.recvBuffer = Buffer.concat([this.recvBuffer, data]);
+        if (this.recvBuffer.length > MAX_BUFFERED_BYTES) {
+            // Slow-loris guard: dribbled bytes without a complete message
+            this.close();
+            return;
+        }
         try {
             this.parseBuffer();
         } catch {
@@ -148,6 +178,10 @@ export class CoopWsPeer {
 
     private pushFragment(opcode: number, chunk: Buffer): void {
         if (opcode !== OP_CONT) {
+            if (this.fragmentedOpcode !== -1) {
+                // RFC 6455 §5.4: new data frame before the final fragment
+                throw new Error("New message before final fragment");
+            }
             // Start of a new fragmented message; drop any stale partial state
             this.fragmentedParts.length = 0;
             this.fragmentedBytes = 0;
@@ -163,16 +197,20 @@ export class CoopWsPeer {
     private handleFrame(fin: boolean, opcode: number, payload: Buffer): void {
         switch (opcode) {
             case OP_CLOSE:
-                this.close();
-                return;
             case OP_PING:
-                if (!fin) {
-                    throw new Error("Fragmented control frame");
-                }
-                this.socket.write(buildFrame(payload, OP_PONG));
-                return;
             case OP_PONG:
-                return; // Keep-alive only
+                // RFC 6455 §5.5: control frames are always final, ≤125 bytes
+                if (!fin || payload.length > 125) {
+                    throw new Error("Invalid control frame");
+                }
+                if (opcode === OP_CLOSE) {
+                    this.close();
+                    return;
+                }
+                if (opcode === OP_PING) {
+                    this.socket.write(buildFrame(payload, OP_PONG));
+                }
+                return; // PONG: keep-alive only
             case OP_TEXT:
             case OP_BINARY:
             case OP_CONT: {
@@ -207,6 +245,7 @@ export class CoopWsPeer {
 
 export class CoopWsServer {
     private server: Server | null = null;
+    private closing: Promise<void> | null = null;
     private nextPeerId = 1;
     private readonly peers = new Map<number, CoopWsPeer>();
 
@@ -226,25 +265,31 @@ export class CoopWsServer {
             return Promise.resolve(this.boundPort());
         }
 
-        return new Promise((resolve, reject) => {
-            const server = createServer((_req, res) => {
-                res.writeHead(426, { "Content-Type": "text/plain" });
-                res.end("shapez CE co-op relay: use a WebSocket client");
-            });
+        const awaitClosing = this.closing;
+        return (async () => {
+            // A rapid stop→start must wait for the old socket to release
+            await awaitClosing;
+            return new Promise<number>((resolve, reject) => {
+                const server = createServer((_req, res) => {
+                    res.writeHead(426, { "Content-Type": "text/plain" });
+                    res.end("shapez CE co-op relay: use a WebSocket client");
+                });
 
-            server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) =>
-                this.handleUpgradeRequest(req, socket, head)
-            );
-            server.on("error", (err: NodeJS.ErrnoException) => {
-                if (!this.server) {
-                    reject(err);
-                }
+                server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) =>
+                    this.handleUpgradeRequest(req, socket, head)
+                );
+                server.on("error", (err: NodeJS.ErrnoException) => {
+                    if (!this.server) {
+                        reject(err);
+                    }
+                });
+                server.listen(port, () => {
+                    this.server = server;
+                    this.closing = null;
+                    resolve(this.boundPort());
+                });
             });
-            server.listen(port, () => {
-                this.server = server;
-                resolve(this.boundPort());
-            });
-        });
+        })();
     }
 
     stop(): Promise<void> {
@@ -259,13 +304,25 @@ export class CoopWsServer {
         if (!server) {
             return Promise.resolve();
         }
-        return new Promise(resolve => server.close(() => resolve()));
+        if (!this.closing) {
+            this.closing = new Promise(resolve => server.close(() => resolve()));
+        }
+        return this.closing;
     }
 
     broadcast(text: string, exceptId = -1): void {
         for (const peer of this.peers.values()) {
-            if (peer.id !== exceptId) {
+            if (peer.id === exceptId) {
+                continue;
+            }
+            try {
                 peer.sendText(text);
+            } catch {
+                try {
+                    peer.close();
+                } catch {
+                    // Ignore close errors
+                }
             }
         }
     }
@@ -279,8 +336,22 @@ export class CoopWsServer {
     handleUpgradeRequest(req: IncomingMessage, socket: Duplex, head: Buffer): void {
         const key = req.headers["sec-websocket-key"];
         const version = req.headers["sec-websocket-version"];
-        if (typeof key !== "string" || version !== "13") {
+        const upgrade = req.headers["upgrade"];
+        const validUpgrade =
+            req.method === "GET" &&
+            typeof key === "string" &&
+            key.length > 0 &&
+            version === "13" &&
+            typeof upgrade === "string" &&
+            upgrade.toLowerCase().includes("websocket");
+        if (!validUpgrade) {
             socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+            socket.destroy();
+            return;
+        }
+
+        if (this.peers.size >= MAX_PEERS) {
+            socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
             socket.destroy();
             return;
         }
@@ -289,16 +360,27 @@ export class CoopWsServer {
             "HTTP/1.1 101 Switching Protocols\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
-                `Sec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`
+                `Sec-WebSocket-Accept: ${computeAccept(key as string)}\r\n\r\n`
         );
 
-        const peer = new CoopWsPeer(this.nextPeerId++, socket, head);
+        const peer = new CoopWsPeer(this.nextPeerId++, socket);
         this.peers.set(peer.id, peer);
         peer.onMessage = (p, text) => this.onMessage?.(p, text);
         peer.onClose = p => {
             this.peers.delete(p.id);
             this.onPeersChanged?.(this.peers.size);
         };
+        if (peer.isClosed()) {
+            // Poisoned upgrade head: drop before announcing
+            this.peers.delete(peer.id);
+            try {
+                socket.destroy();
+            } catch {
+                // Ignore
+            }
+            return;
+        }
+        peer.feedInitialData(head);
         this.onPeersChanged?.(this.peers.size);
     }
 }
