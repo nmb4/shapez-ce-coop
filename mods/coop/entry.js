@@ -973,15 +973,22 @@ export default class CoopMod extends ModBase {
             return uid;
         };
 
-        // --- Replicate local building ops ----------------------------------
-        // NOTE: runAfterMethod does not receive the return value, so the
-        // placement hooks use replaceMethod to capture the result entity.
-        this.modInterface.replaceMethod(GameLogic, "tryPlaceBuilding", function (oldFn, args) {
+        // --- Replicate entity creation at the true choke point --------------
+        // Every creation path (tryPlaceBuilding, blueprint paste, puzzle
+        // setup) funnels through EntityManager.registerEntity, AFTER the
+        // UID is assigned — so capture the op here instead of in
+        // tryPlaceBuilding (which blueprint paste bypasses entirely).
+        this.modInterface.replaceMethod(EntityManager, "registerEntity", function (oldFn, args) {
             const result = oldFn(...args);
-            if (!mod.session || mod.applyingRemote || !result) {
+            const entity = args[0];
+            if (!mod.session || mod.applyingRemote || !entity) {
                 return result;
             }
-            mod.queueOp({ k: "place", uid: result.uid, entity: result.serialize() });
+            const root = this.root;
+            if (!root || !root.gameInitialized) {
+                return result; // game setup (hub, loads): covered by snapshots
+            }
+            mod.queueOp({ k: "place", uid: entity.uid, entity: entity.serialize() });
             return result;
         });
 
@@ -1735,6 +1742,8 @@ export default class CoopMod extends ModBase {
         try {
             for (const belt of belts) {
                 try {
+                    // Direct mutation only: no placement hooks fire, so the
+                    // flag is informative, not load-bearing.
                     system.updateSurroundingBeltPlacement(belt);
                 } catch (ex) {
                     warn("belt reconverge failed", ex);
@@ -2082,6 +2091,9 @@ export default class CoopMod extends ModBase {
             // Root partially ready; proceed without restoring
         }
         try {
+            // Snapshot apply must not echo: every deserialized entity flows
+            // through registerEntity, which replicates placements live.
+            this.applyingRemote = true;
             this.clearRoot(root);
             const SavegameSerializer = shapez("SavegameSerializer");
             const result = new SavegameSerializer().deserialize(dump, root);
@@ -2111,6 +2123,8 @@ export default class CoopMod extends ModBase {
             this.lastResyncRequest = 0; // allow this one immediate retry
             this.requestResync();
             return;
+        } finally {
+            this.applyingRemote = false;
         }
         this.welcomeFailures = 0;
         // Ops made while "syncing…" are causally newer than the snapshot
@@ -2120,44 +2134,39 @@ export default class CoopMod extends ModBase {
     }
 
     clearRoot(root) {
-        this.applyingRemote = true;
+        const entities = Array.from(root.entityMgr.entities.values());
+        for (const entity of entities) {
+            try {
+                root.map.removeStaticEntity(entity);
+            } catch {
+                // Entity may already be half-removed; continue
+            }
+            root.entityMgr.destroyEntity(entity);
+        }
+        root.entityMgr.processDestroyList();
+        // A full wipe invalidates the whole mass selection; stale UIDs
+        // crash the selector's draw pass (null.components).
         try {
-            const entities = Array.from(root.entityMgr.entities.values());
-            for (const entity of entities) {
-                try {
-                    root.map.removeStaticEntity(entity);
-                } catch {
-                    // Entity may already be half-removed; continue
-                }
-                root.entityMgr.destroyEntity(entity);
+            const parts = root.hud && root.hud.parts;
+            const ms = parts && parts.massSelector;
+            if (ms && typeof ms.clearSelection === "function") {
+                ms.clearSelection();
+            } else if (ms && ms.selectedUids) {
+                ms.selectedUids.clear();
             }
-            root.entityMgr.processDestroyList();
-            // A full wipe invalidates the whole mass selection; stale UIDs
-            // crash the selector's draw pass (null.components).
-            try {
-                const parts = root.hud && root.hud.parts;
-                const ms = parts && parts.massSelector;
-                if (ms && typeof ms.clearSelection === "function") {
-                    ms.clearSelection();
-                } else if (ms && ms.selectedUids) {
-                    ms.selectedUids.clear();
-                }
-            } catch {
-                // Best effort
+        } catch {
+            // Best effort
+        }
+        // Belt paths are rebuilt incrementally on entity add AND appended
+        // by deserializePaths — without clearing, every resync duplicates
+        // all belts and simulates them twice.
+        try {
+            const belt = root.systemMgr.systems.belt;
+            if (belt && Array.isArray(belt.beltPaths)) {
+                belt.beltPaths.length = 0;
             }
-            // Belt paths are rebuilt incrementally on entity add AND appended
-            // by deserializePaths — without clearing, every resync duplicates
-            // all belts and simulates them twice.
-            try {
-                const belt = root.systemMgr.systems.belt;
-                if (belt && Array.isArray(belt.beltPaths)) {
-                    belt.beltPaths.length = 0;
-                }
-            } catch {
-                // Non-fatal; belt system will reconcile on next update
-            }
-        } finally {
-            this.applyingRemote = false;
+        } catch {
+            // Non-fatal; belt system will reconcile on next update
         }
     }
 
