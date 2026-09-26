@@ -41,6 +41,9 @@ Allow inbound TCP on port 47821 through the firewall.
   per peer per minute). Either side can also trigger a manual resync.
 - Up to 8 players (host + 7 UID slots); each session is trusted-LAN
   (no auth/encryption).
+- Drops and crashes are handled gracefully: peers age out within ~10s,
+  the panel shows "disconnected — playing solo copy", and clients
+  auto-reconnect (rejoining the host's new session if it restarted).
 - Cameras, settings, keybindings: NOT synced (per-player, by design).
 
 ## The panel (bottom-right)

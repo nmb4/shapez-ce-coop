@@ -870,6 +870,8 @@ export default class CoopMod extends ModBase {
         this.pingTimer = null;
         this.sweepTimer = null;
         this.cursorTimer = null;
+        this.reconnectTimer = null;
+        this.reconnectAttempts = 0;
         this.lastCursorSent = null;
         this.lastSyncText = "-";
         this.lastStatusText = "offline";
@@ -942,7 +944,14 @@ export default class CoopMod extends ModBase {
 
         this.modInterface.replaceMethod(GameLogic, "tryDeleteBuilding", function (oldFn, args) {
             const building = args[0];
+            const uid = building ? building.uid : null;
             const result = oldFn(...args);
+            if (result && uid !== null) {
+                // Always (offline, remote-applied, replaced): a destroyed
+                // entity left in the mass selector's set crashes its draw
+                // pass on the next frame (null.components).
+                mod.dropFromMassSelection(this.root, uid);
+            }
             if (!mod.session || mod.applyingRemote || !result || !building) {
                 return result;
             }
@@ -1335,6 +1344,7 @@ export default class CoopMod extends ModBase {
             clearInterval(this.cursorTimer);
             this.cursorTimer = null;
         }
+        this.stopReconnectLoop();
     }
 
     endTimers() {
@@ -1416,19 +1426,63 @@ export default class CoopMod extends ModBase {
     }
 
     onSocketOpen() {
+        this.stopReconnectLoop();
         if (!this.session) {
             return;
         }
-        if (this.session.isHost) {
-            this.setStatus("hosting (waiting for join)", "ok");
-        } else {
+        // Fresh connection, fresh election: a restarted host has a new id.
+        this.hostId = this.session.isHost ? this.net.clientId : null;
+        if (!this.session.isHost) {
+            // Drop ghosts from the dead connection; hellos rebuild the list.
+            for (const id of this.peers.keys()) {
+                if (id !== this.net.clientId) {
+                    this.peers.delete(id);
+                }
+            }
+            this.renderPeers();
+            this.flushOps();
             this.setStatus("syncing…", "warn");
+        } else if (this.session.isHost) {
+            this.setStatus("hosting (waiting for join)", "ok");
         }
     }
 
     onSocketClose() {
-        if (this.session) {
-            this.setStatus(this.session.isHost ? "relay lost" : "disconnected", "err");
+        if (!this.session) {
+            return;
+        }
+        // Age everyone out fast (sweep collects them within ~10s) instead
+        // of showing a dead session as healthy for 30s.
+        const now = Date.now();
+        for (const [id, peer] of this.peers) {
+            if (id !== this.net.clientId) {
+                peer.lastSeen = Math.min(peer.lastSeen, now - (PEER_EXPIRE_MS - 10000));
+            }
+        }
+        this.renderPeers();
+        this.setStatus(this.session.isHost ? "relay lost" : "disconnected", "err");
+        this.setSync("disconnected — playing solo copy");
+        this.startReconnectLoop();
+    }
+
+    startReconnectLoop() {
+        this.stopReconnectLoop();
+        this.reconnectAttempts = 0;
+        this.reconnectTimer = setInterval(() => {
+            if (!this.session || !this.net.url || this.net.connected) {
+                this.stopReconnectLoop();
+                return;
+            }
+            this.reconnectAttempts++;
+            this.setStatus("reconnecting… (" + this.reconnectAttempts + ")", "warn");
+            this.net.connect(this.net.url);
+        }, 5000);
+    }
+
+    stopReconnectLoop() {
+        if (this.reconnectTimer) {
+            clearInterval(this.reconnectTimer);
+            this.reconnectTimer = null;
         }
     }
 
@@ -1481,6 +1535,20 @@ export default class CoopMod extends ModBase {
         }
         this.lastCursorSent = { x, y };
         this.net.send({ t: "cursor", x, y });
+    }
+
+    /** Drop one UID from the game's mass selection (stale entries crash
+     *  its draw pass). Runs for every delete, any session state. */
+    dropFromMassSelection(root, uid) {
+        try {
+            const parts = root && root.hud && root.hud.parts;
+            const ms = parts && parts.massSelector;
+            if (ms && ms.selectedUids) {
+                ms.selectedUids.delete(uid);
+            }
+        } catch {
+            // Selection state is best-effort only
+        }
     }
 
     /** Entities whose tile bounds overlap the given inclusive tile rect. */
@@ -1959,6 +2027,19 @@ export default class CoopMod extends ModBase {
                 root.entityMgr.destroyEntity(entity);
             }
             root.entityMgr.processDestroyList();
+            // A full wipe invalidates the whole mass selection; stale UIDs
+            // crash the selector's draw pass (null.components).
+            try {
+                const parts = root.hud && root.hud.parts;
+                const ms = parts && parts.massSelector;
+                if (ms && typeof ms.clearSelection === "function") {
+                    ms.clearSelection();
+                } else if (ms && ms.selectedUids) {
+                    ms.selectedUids.clear();
+                }
+            } catch {
+                // Best effort
+            }
             // Belt paths are rebuilt incrementally on entity add AND appended
             // by deserializePaths — without clearing, every resync duplicates
             // all belts and simulates them twice.
