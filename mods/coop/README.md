@@ -13,6 +13,10 @@ Experimental 2-player (N-capable) cooperative multiplayer for shapez CE.
 
 ## Running it
 
+Both sides must run the **same co-op version** (shown in the panel
+title) — mismatches warn in chat, since sync logic differs between
+versions.
+
 1. Build both processes (main + renderer). From the repo root:
    `npm i`, then `npm run gulp` in one terminal and `npm start -- --dev --load-mod mods/coop --watch`
    in `electron/` (see root README for prerequisites).

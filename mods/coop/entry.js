@@ -277,7 +277,13 @@ class CoopNet {
             }
             this.connected = true;
             log("connected as", this.clientId);
-            this.send({ t: "hello", v: COOP_VERSION, from: this.clientId, name: this.name });
+            this.send({
+                t: "hello",
+                v: COOP_VERSION,
+                from: this.clientId,
+                name: this.name,
+                mv: (this.mod.metadata && this.mod.metadata.version) || null,
+            });
             if (this.onOpen) {
                 this.onOpen();
             }
@@ -895,6 +901,7 @@ export default class CoopMod extends ModBase {
         this.pendingOps = [];
         this.flushScheduled = false;
         this.opSeq = 0;
+        this.versionWarned = new Set();
         this.slot = 1; // UID slot (0 = host); assigned by welcome, 1 pre-join
         this.hostId = null; // clientId of the session host, once known
         this.slots = new Map(); // host: peerId -> slot (stable across rejoins)
@@ -1285,6 +1292,7 @@ export default class CoopMod extends ModBase {
         this.peers.clear();
         this.mismatches.clear();
         this.lastResync.clear();
+        this.versionWarned.clear();
         this.awaitingWelcome = !isHost;
         if (isHost) {
             this.hostId = this.net.clientId;
@@ -1727,7 +1735,6 @@ export default class CoopMod extends ModBase {
         if (!system) {
             return 0;
         }
-        let fixed = 0;
         const belts = [];
         try {
             for (const entity of root.entityMgr.entities.values()) {
@@ -1738,22 +1745,16 @@ export default class CoopMod extends ModBase {
         } catch {
             return 0;
         }
-        this.applyingRemote = true;
-        try {
-            for (const belt of belts) {
-                try {
-                    // Direct mutation only: no placement hooks fire, so the
-                    // flag is informative, not load-bearing.
-                    system.updateSurroundingBeltPlacement(belt);
-                } catch (ex) {
-                    warn("belt reconverge failed", ex);
-                }
+        // Direct mutation only (no placement hooks fire), so no
+        // applyingRemote guard is needed here.
+        for (const belt of belts) {
+            try {
+                system.updateSurroundingBeltPlacement(belt);
+            } catch (ex) {
+                warn("belt reconverge failed", ex);
             }
-            fixed = belts.length;
-        } finally {
-            this.applyingRemote = false;
         }
-        return fixed;
+        return belts.length;
     }
 
     /** Client: ask the host for a full snapshot. */
@@ -1899,6 +1900,7 @@ export default class CoopMod extends ModBase {
                 return;
             }
             case "hello":
+                this.checkPeerVersion(message);
                 if (this.session.isHost) {
                     const peer = this.peers.get(message.from);
                     if (peer) {
@@ -1998,6 +2000,23 @@ export default class CoopMod extends ModBase {
             }
             default:
                 warn("unknown message type", message.t);
+        }
+    }
+
+    /** Warn once per peer about mod version skew (different hashes lie). */
+    checkPeerVersion(message) {
+        const own = this.metadata && this.metadata.version;
+        const theirs = message.mv;
+        if (!own || !theirs || own === theirs || this.versionWarned.has(message.from)) {
+            return;
+        }
+        this.versionWarned.add(message.from);
+        const text =
+            "version mismatch: " + (message.name || message.from) + " runs co-op " + theirs + ", you run " + own + " — update both sides";
+        warn(text);
+        const part = this.coopPart || this.hud;
+        if (part) {
+            part.addChat("system", text);
         }
     }
 

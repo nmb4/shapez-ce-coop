@@ -24,10 +24,12 @@ is unauthenticated (trusted LAN only).
 ### `hello` (client → all, on connect)
 
 ```json
-{ "t": "hello", "from": "<id>", "name": "Player" }
+{ "t": "hello", "from": "<id>", "name": "Player", "mv": "0.8.1" }
 ```
 
 The host replies with `welcome`. Anyone may update their peer list UI.
+`mv` is the co-op mod version; mismatches warn loudly since hash logic
+differs between versions. **Run the same version on all sides.**
 
 ### `welcome` (host → joining client)
 
