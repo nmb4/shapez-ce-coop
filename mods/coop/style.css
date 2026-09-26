@@ -1,0 +1,218 @@
+/* Co-op panel, following the game's own HUD idiom (waypoints hint, dialogs).
+ * Base rules are the light theme; html[data-theme="dark"] overrides below.
+ * All sizing is rem-based, so the panel follows the game's UI scale setting
+ * (root font-size) automatically. */
+
+#ingame_HUD_Coop {
+    position: absolute;
+    right: 1rem;
+    bottom: 1rem;
+    z-index: 500;
+    width: 23rem;
+    background: rgba(245, 246, 250, 0.96);
+    color: #333438;
+    border-radius: 0.6rem;
+    padding: 0.7rem 0.9rem;
+    font-family: "GameFont", sans-serif;
+    font-size: 1.2rem;
+    line-height: 1.6rem;
+    pointer-events: all;
+    user-select: none;
+    box-shadow: 0 0.2rem 1rem rgba(0, 0, 0, 0.25);
+}
+
+html[data-theme="dark"] #ingame_HUD_Coop {
+    background: rgba(51, 52, 59, 0.92);
+    color: #eee;
+}
+
+#ingame_HUD_Coop .coopHead {
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+#ingame_HUD_Coop .coopTitle {
+    flex: 1;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+#ingame_HUD_Coop .coopDot {
+    display: inline-block;
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    background: #777;
+    margin-right: 0.5rem;
+}
+
+#ingame_HUD_Coop .coopVersion {
+    opacity: 0.55;
+    font-weight: normal;
+    margin-left: 0.3rem;
+}
+
+#ingame_HUD_Coop .coopHide {
+    cursor: pointer;
+    min-width: 2rem;
+    text-align: center;
+    padding: 0.2rem 0.4rem;
+    border-radius: 0.6rem;
+    font-size: 1.5rem;
+    line-height: 1;
+    pointer-events: all;
+}
+
+#ingame_HUD_Coop .coopHide:hover {
+    background: rgba(0, 0, 0, 0.08);
+}
+
+html[data-theme="dark"] #ingame_HUD_Coop .coopHide:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+#ingame_HUD_Coop .coopRow {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 0.4rem;
+}
+
+#ingame_HUD_Coop .coopRow:last-child {
+    margin-bottom: 0;
+}
+
+#ingame_HUD_Coop button {
+    flex: 1;
+    font-family: inherit;
+    font-size: 1.2rem;
+    line-height: 1.6rem;
+    background: #eee;
+    color: #333438;
+    border: 1px solid #c9ccd6;
+    border-radius: 0.6rem;
+    padding: 0.35rem 0.5rem;
+    cursor: pointer;
+    pointer-events: all;
+}
+
+html[data-theme="dark"] #ingame_HUD_Coop button {
+    border: 0;
+}
+
+#ingame_HUD_Coop button:hover {
+    background: #e7e7e7;
+}
+
+#ingame_HUD_Coop button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+#ingame_HUD_Coop button.primary {
+    background: rgb(74, 151, 223);
+    border-color: rgb(74, 151, 223);
+    color: #fff;
+}
+
+#ingame_HUD_Coop button.primary:hover {
+    opacity: 0.9;
+}
+
+#ingame_HUD_Coop button.good {
+    background: #66bb6a;
+    border-color: #66bb6a;
+    color: #fff;
+}
+
+#ingame_HUD_Coop button.good:hover {
+    opacity: 0.9;
+}
+
+#ingame_HUD_Coop input,
+#ingame_HUD_Coop select {
+    font-family: inherit;
+    font-size: 1.2rem;
+    background: #dee1ea;
+    color: #333438;
+    border: 0;
+    border-radius: 0.6rem;
+    padding: 0.35rem 0.5rem;
+    width: 100%;
+    box-sizing: border-box;
+    pointer-events: all;
+    user-select: text;
+}
+
+html[data-theme="dark"] #ingame_HUD_Coop input,
+html[data-theme="dark"] #ingame_HUD_Coop select {
+    background: #eee;
+}
+
+#ingame_HUD_Coop input::placeholder {
+    color: #333438;
+    opacity: 0.45;
+}
+
+#ingame_HUD_Coop input[readonly] {
+    user-select: all;
+}
+
+#ingame_HUD_Coop .coopInviteRow {
+    display: none;
+    margin-bottom: 0.4rem;
+}
+
+#ingame_HUD_Coop .coopInviteSel {
+    margin-bottom: 0.4rem;
+}
+
+#ingame_HUD_Coop .coopSync,
+#ingame_HUD_Coop .coopPeers {
+    color: #7d808a;
+    font-size: 1.1rem;
+    margin-bottom: 0.3rem;
+}
+
+html[data-theme="dark"] #ingame_HUD_Coop .coopSync,
+html[data-theme="dark"] #ingame_HUD_Coop .coopPeers {
+    color: #babcbf;
+}
+
+#ingame_HUD_Coop .coopChat {
+    max-height: 9rem;
+    overflow-y: auto;
+    margin-bottom: 0.4rem;
+    font-size: 1.1rem;
+    pointer-events: all;
+}
+
+#ingame_HUD_Coop_Pill {
+    position: absolute;
+    right: 1rem;
+    bottom: 1rem;
+    z-index: 500;
+    background: rgba(245, 246, 250, 0.96);
+    color: #333438;
+    border-radius: 1rem;
+    padding: 0.3rem 0.9rem;
+    font-family: "GameFont", sans-serif;
+    font-size: 1.2rem;
+    cursor: pointer;
+    pointer-events: all;
+    box-shadow: 0 0.2rem 1rem rgba(0, 0, 0, 0.25);
+}
+
+html[data-theme="dark"] #ingame_HUD_Coop_Pill {
+    background: rgba(51, 52, 59, 0.92);
+    color: #eee;
+}
+
+#ingame_HUD_Coop_Pill .coopPillDot {
+    display: inline-block;
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    background: #777;
+    margin-right: 0.5rem;
+}
