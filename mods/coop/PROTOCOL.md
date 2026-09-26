@@ -1,4 +1,4 @@
-# Co-op wire protocol (v1)
+# Co-op wire protocol (v2)
 
 Transport: WebSocket text frames carrying JSON. The Electron main-process
 relay (`electron/src/coop/`) broadcasts every message to all connected
@@ -9,11 +9,15 @@ Clients MUST ignore messages whose `from` equals their own `clientId`
 All messages share the envelope:
 
 ```json
-{ "t": "<type>", "v": 1, "from": "<clientId>", ... }
+{ "t": "<type>", "v": 2, "from": "<clientId>", ... }
 ```
 
 `v` is the protocol version. Drop messages with unknown `v`. Unknown `t`
 values MUST be ignored (forward compatibility).
+
+Clients remember the sender of their first valid `welcome` as the session
+host and ignore `welcome`/`hub-state` from anyone else. The relay itself
+is unauthenticated (trusted LAN only).
 
 ## Message types
 
@@ -28,12 +32,21 @@ The host replies with `welcome`. Anyone may update their peer list UI.
 ### `welcome` (host → joining client)
 
 ```json
-{ "t": "welcome", "to": "<clientId>", "dump": { ...SerializedGame... } }
+{ "t": "welcome", "to": "<clientId>", "slot": 2, "dump": { ...SerializedGame... } }
 ```
 
 `dump` is exactly what `SavegameSerializer.generateDumpFromGameRoot`
 produces. Clients ignore it unless `to` matches their `clientId` or is
-`"*"` (host-initiated resync of everyone). Hosts never apply welcomes.
+`"*"` (host-initiated resync of everyone), and unless it comes from the
+session host. Hosts never apply welcomes.
+
+`slot` is the client's UID allocation slot (see below); rejoins keep
+their slot. The receiver keeps its own camera (the snapshot is about
+buildings, not where you look) and replays locally-held pre-snapshot ops
+after applying (duplicates are skipped by UID).
+
+UID allocation uses stride 8: residue 0 = host, 1..7 = client slots
+(8 players max). Receivers bump `nextUid` past seen UIDs (forward-only).
 
 ### `sync-check` (client → host, every 15s)
 
@@ -42,7 +55,10 @@ produces. Clients ignore it unless `to` matches their `clientId` or is
 ```
 
 `hash` is an FNV-1a checksum over the structural sim state (map seed,
-entity count + UID xor, hub level, upgrade levels, stored shapes).
+entity count, hub level, upgrade levels, plus per-entity identity tuples
+so moves, rotations and same-UID collisions are detected).
+Stored-shape counters are excluded: they legitimately differ between
+delivery batches and hub-state broadcasts and must not count as drift.
 `seq` is the sender's latest `ops` sequence number (diagnostic for now).
 The host compares against its own hash: two consecutive mismatches
 trigger a targeted `welcome`; auto-resyncs are rate-limited to one per
@@ -50,8 +66,9 @@ peer per minute.
 
 ### `resync-request` (client → host)
 
-Ask the host for a targeted `welcome`. Also available as the host's
-`welcome` with `to: "*"` (resync everyone).
+Ask the host for a targeted `welcome` (same per-peer cooldown as
+auto-resyncs). Also available as the host's `welcome` with `to: "*"`
+(resync everyone).
 
 ### `bye` (either → all, on leave)
 
@@ -75,13 +92,6 @@ Round-trip measurement for the peer list. `pong` is only processed when
 Map cursor in world pixels (see `Camera.screenToWorld`), sent only when
 changed since the last broadcast. Ephemeral: receivers expire it after
 ~2.5s without an update and never persist it.
-```json
-{ "t": "ping-req", "to": "*", "t0": 1727260800000 }
-{ "t": "pong", "to": "<clientId>", "t0": 1727260800000 }
-```
-
-Round-trip measurement for the peer list. `pong` is only processed when
-`to` matches the local client.
 
 ### `ops` (either → all)
 
@@ -98,17 +108,18 @@ Ordered building operations, applied in array order:
 }
 ```
 
-- `seq` is a per-sender monotonic counter (gap detection is future work;
-  it is echoed back in `sync-check` today).
+- `seq` is a per-sender monotonic counter (diagnostic for now).
 - `place`: `entity` is one entry of the serialized entity map
-  (`entity.serialize()`). If the UID is already present, skip it.
-  Otherwise deserialize it and bump `entityMgr.nextUid` past it.
+  (`entity.serialize()`) with `entity.uid === uid`. If the UID is already
+  present (including queued-for-destroy), skip it. Otherwise deserialize it
+  and bump `entityMgr.nextUid` past it.
 - `delete`: look up by UID, `tryDeleteBuilding` if found.
 - Receivers MUST NOT rebroadcast applied ops.
+- Batches are capped at 5000 entries.
 
-UID spaces: host allocates even UIDs, clients odd (see mod), so
-host↔client placements never collide. Client↔client collisions resolve
-as first-writer-wins (late duplicate UID is dropped).
+UID allocation uses stride 8 (see `welcome`): disjoint by construction;
+any residual collision resolves as first-writer-wins and is caught by the
+sync hash.
 
 ### `hub-upgrade` (either → all)
 
@@ -116,7 +127,9 @@ as first-writer-wins (late duplicate UID is dropped).
 { "t": "hub-upgrade", "upgradeId": "belt", "level": 3 }
 ```
 
-Receiver purchases the upgrade until its local level reaches `level`.
+Receiver purchases the upgrade until its local level reaches `level`;
+if funds lag behind the broadcast the receiver force-converges (the
+purchaser already paid) instead of reverting on the next `hub-state`.
 
 ### `hub-state` (host → all, every 5s + on goal completion)
 
@@ -134,8 +147,10 @@ Host ignores it.
 ```
 
 The host replays each shape through
-`HubGoals.handleDefinitionDelivered`. Keys are `ShapeDefinition.getHash()`
+`HubGoals.handleDefinitionDelivered`, spread over ~120 frames so analytics
+slices observe smooth rates. Keys are `ShapeDefinition.getHash()`
 strings, resolvable via `shapeDefinitionMgr.getShapeFromShortKey`.
+Batches are capped at 256 keys with a bounded per-frame replay budget.
 
 ### `chat` (either → all)
 

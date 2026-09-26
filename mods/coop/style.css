@@ -36,6 +36,7 @@ html[data-theme="dark"] #ingame_HUD_Coop {
     flex: 1;
     font-weight: bold;
     cursor: pointer;
+    pointer-events: all;
 }
 
 #ingame_HUD_Coop .coopDot {

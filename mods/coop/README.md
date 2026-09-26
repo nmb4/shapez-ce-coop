@@ -28,17 +28,19 @@ Experimental 2-player (N-capable) cooperative multiplayer for shapez CE.
 Find the host IP with `ipconfig` (Windows) / `ip addr` (Linux).
 Allow inbound TCP on port 47821 through the firewall.
 
-## What syncs in v1
+## What syncs
 
 - Building placement and deletion on both layers (regular + wires),
-  including blueprint pastes (batched) and mass delete.
+  including blueprint pastes (batched) and ctrl+right-drag area delete.
 - Upgrade purchases, hub level/rewards, deliveries (batched, replayed
   smoothly so throughput goals and statistics see correct rates),
   pinned shapes + waypoints (via full-state join sync).
-- Drift protection: clients checksum shared state every 15s; the host
-  pushes a full snapshot after two consecutive mismatches (max one
-  auto-resync per peer per minute). Either side can also trigger a
-  manual resync from the panel.
+- Live map cursors with AFK ghosts.
+- Drift protection: structural checksums every 15s; the host pushes a
+  full snapshot after two consecutive mismatches (max one auto-resync
+  per peer per minute). Either side can also trigger a manual resync.
+- Up to 8 players (host + 7 UID slots); each session is trusted-LAN
+  (no auth/encryption).
 - Cameras, settings, keybindings: NOT synced (per-player, by design).
 
 ## The panel (bottom-right)

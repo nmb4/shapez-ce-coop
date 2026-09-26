@@ -12,16 +12,16 @@
 //    the host replays them through HubGoals.handleDefinitionDelivered and
 //    broadcasts hub-state every few seconds + on goal completion.
 //  - Determinism aid: fixed 60 Hz tick while a session is active, and
-//    partitioned UID allocation (host even / clients odd).
+//    UID slots (stride 8: host 0, clients 1..7) so allocations never collide.
+//  - Drift guard: structural sync-checks with auto-resync backstop.
 //
-// v1 limits: 2 players recommended (N supported, client-client UID spaces
-// still shared), no lag compensation, no auth/encryption (LAN/trusted only),
-// dialogs pause the local sim (can cause short-term divergence).
+// Limits: 8 players max, no lag compensation, no auth/encryption
+// (LAN/trusted only), dialogs pause the local sim (short-term divergence).
 
 const ModBase = window.shapez.Mod;
 
 const COOP_TICKRATE = 60;
-const COOP_VERSION = 1;
+const COOP_VERSION = 2;
 const COOP_DEFAULT_PORT = 47821;
 const HUB_STATE_INTERVAL_MS = 5000;
 const DELIVERY_FLUSH_MS = 2000;
@@ -29,6 +29,14 @@ const SYNC_CHECK_MS = 15000;
 const PING_MS = 10000;
 const PEER_EXPIRE_MS = 30000;
 const RESYNC_COOLDOWN_MS = 60000;
+// UID allocation stride. Residue 0 = host, 1..7 = client slots (8 players
+// max, matching the relay peer cap). See sendWelcome slot assignment.
+const SLOT_STEP = 8;
+const MAX_CLIENT_SLOTS = 7;
+// Inbound sanity caps (malicious/buggy peers, giant area deletes).
+const MAX_OPS_PER_MESSAGE = 5000;
+const MAX_BATCH_KEYS = 256;
+const MAX_REPLAY_PER_FRAME = 2000;
 // Remote cursor broadcast: 10 Hz while in a session, peers expire them fast.
 const CURSOR_MS = 100;
 const CURSOR_EXPIRE_MS = 2500;
@@ -66,7 +74,10 @@ function fnv1aHex(text) {
 
 /**
  * Structural checksum of the shared sim state. Excludes wall-clock time,
- * cameras and in-flight belt items so two converged peers agree.
+ * cameras, in-flight belt items and stored-shape counters (those converge
+ * via hub-state on their own beat and must not count as drift). Includes
+ * per-entity identity tuples so moves, rotations, variant swaps and
+ * same-UID collisions are detected.
  */
 function computeSyncHash(root) {
     const upgradeParts = [];
@@ -74,24 +85,25 @@ function computeSyncHash(root) {
     for (const id of Object.keys(upgrades).sort()) {
         upgradeParts.push(id + ":" + upgrades[id]);
     }
-    const storedParts = [];
-    const stored = root.hubGoals.storedShapes || {};
-    for (const key of Object.keys(stored).sort()) {
-        storedParts.push(key + ":" + stored[key]);
+    const entityParts = [];
+    for (const [uid, entity] of root.entityMgr.entities) {
+        try {
+            const staticComp = entity.components.StaticMapEntity;
+            entityParts.push(
+                uid + ":" + staticComp.code + ":" + staticComp.rotation + ":" +
+                staticComp.origin.x + "," + staticComp.origin.y
+            );
+        } catch {
+            entityParts.push(uid + ":?");
+        }
     }
-    let uidXor = 0;
-    let uidCount = 0;
-    for (const uid of root.entityMgr.entities.keys()) {
-        uidXor ^= uid | 0;
-        uidCount++;
-    }
+    entityParts.sort();
     const summary = {
         seed: root.map.seed,
-        n: uidCount,
-        xor: uidXor >>> 0,
+        n: entityParts.length,
         level: root.hubGoals.level,
         upgrades: upgradeParts.join(","),
-        stored: storedParts.join(","),
+        entities: entityParts.join(";"),
     };
     return fnv1aHex(JSON.stringify(summary));
 }
@@ -430,10 +442,31 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
             input.addEventListener("keyup", event => event.stopPropagation());
         }
         this.chatInput.addEventListener("keyup", event => event.stopPropagation());
+        this.inviteSelect.addEventListener("keydown", event => event.stopPropagation());
+        this.inviteSelect.addEventListener("keyup", event => event.stopPropagation());
+        for (const button of this.element.querySelectorAll("button")) {
+            button.addEventListener("keydown", event => event.stopPropagation());
+            button.addEventListener("keyup", event => event.stopPropagation());
+        }
+        // F8 toggles the panel even when a field has focus: capture on the
+        // panel runs before the field handlers and the game listener.
+        this.element.addEventListener(
+            "keydown",
+            event => {
+                if (event.keyCode === 119) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (activeMod) {
+                        activeMod.togglePanel();
+                    }
+                }
+            },
+            true
+        );
         // Direct reference so panel toggles work without a session too
         if (activeMod) {
             activeMod.coopPart = this;
-            this.applyPanelMode(activeMod.panelMode);
+            activeMod.syncPanelFromMod();
         }
     }
 
@@ -455,7 +488,13 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
             if (event.button === 2 && event.ctrlKey) {
                 event.preventDefault();
                 event.stopPropagation();
-                this.areaDrag = { x0: event.clientX, y0: event.clientY, x1: event.clientX, y1: event.clientY };
+                this.areaDrag = {
+                    x0: event.clientX,
+                    y0: event.clientY,
+                    x1: event.clientX,
+                    y1: event.clientY,
+                    at: Date.now(),
+                };
                 this.suppressContextMenuUntil = Date.now() + 1000;
             }
         };
@@ -470,7 +509,7 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
             if (!this.areaDrag) {
                 return;
             }
-            if (event.button === 2) {
+            if (event.button === 2 && event.ctrlKey && Date.now() - this.areaDrag.at < 60000) {
                 event.preventDefault();
                 event.stopPropagation();
                 const drag = this.areaDrag;
@@ -479,8 +518,13 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
                     activeMod.finishAreaDelete(this.root, drag);
                 }
             } else {
+                // Wrong button, ctrl released, or a stale rect from a
+                // missed mouseup (alt-tab): never fire it later.
                 this.areaDrag = null;
             }
+        };
+        this.onWindowBlur = () => {
+            this.areaDrag = null;
         };
         this.onWindowContextMenu = event => {
             if (Date.now() < this.suppressContextMenuUntil) {
@@ -492,12 +536,23 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
         window.addEventListener("mousemove", this.onWindowMouseMove, true);
         window.addEventListener("mouseup", this.onWindowMouseUp, true);
         window.addEventListener("contextmenu", this.onWindowContextMenu, true);
+        window.addEventListener("blur", this.onWindowBlur, true);
     }
 
     cleanup() {
         super.cleanup();
         if (activeMod && activeMod.coopPart === this) {
             activeMod.coopPart = null;
+        }
+        // HUD DOM is never removed by the game; drop ours or stale
+        // duplicate panels stay live over menus and later games.
+        if (this.element) {
+            this.element.remove();
+            this.element = null;
+        }
+        if (this.pill) {
+            this.pill.remove();
+            this.pill = null;
         }
         if (this.blurOnCanvasDown) {
             document.removeEventListener("mousedown", this.blurOnCanvasDown, true);
@@ -507,6 +562,7 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
         window.removeEventListener("contextmenu", this.onWindowContextMenu, true);
         window.removeEventListener("mousemove", this.onWindowMouseMove, true);
         window.removeEventListener("mouseup", this.onWindowMouseUp, true);
+        window.removeEventListener("blur", this.onWindowBlur, true);
         this.areaDrag = null;
     }
 
@@ -796,6 +852,13 @@ export default class CoopMod extends ModBase {
         this.pendingOps = [];
         this.flushScheduled = false;
         this.opSeq = 0;
+        this.slot = 1; // UID slot (0 = host); assigned by welcome, 1 pre-join
+        this.hostId = null; // clientId of the session host, once known
+        this.slots = new Map(); // host: peerId -> slot (stable across rejoins)
+        this.nextSlot = 1;
+        this.awaitingWelcome = false; // client: hold ops until first snapshot
+        this.hookedRoots = new WeakSet();
+        this.lastResyncRequest = 0;
         this.deliveryCounts = new Map();
         this.deliveryQueue = []; // host-side smoothed replay: { def, remaining, perFrame }
         this.peers = new Map(); // clientId -> { name, lastSeen, rtt, isHost }
@@ -809,6 +872,9 @@ export default class CoopMod extends ModBase {
         this.cursorTimer = null;
         this.lastCursorSent = null;
         this.lastSyncText = "-";
+        this.lastStatusText = "offline";
+        this.lastStatusKind = null;
+        this.lastInvites = [];
         this.panelMode = "open"; // open | collapsed | hidden
         this.coopPart = null; // live HUD part; session-independent access
         this.net = new CoopNet(this);
@@ -830,26 +896,35 @@ export default class CoopMod extends ModBase {
         const origSetTickRate = DynamicTickrate.prototype.setTickRate;
         DynamicTickrate.prototype.setTickRate = function (rate) {
             if (mod.session && rate !== COOP_TICKRATE) {
+                try {
+                    // Puzzle mode has its own fixed rate; only lock regular play
+                    if (!this.root || !this.root.gameMode || this.root.gameMode.getId() !== "regularMode") {
+                        return origSetTickRate.call(this, rate);
+                    }
+                } catch {
+                    // Fall through to the lock when the mode is unreadable
+                }
                 rate = COOP_TICKRATE;
             }
             return origSetTickRate.call(this, rate);
         };
 
-        // --- Partition UID allocation: host even, clients odd --------------
+        // --- Partition UID allocation into host/client slots --------------
+        // Stride SLOT_STEP with residue = slot keeps every peer disjoint
+        // even after full-state syncs (all peers derive from one nextUid).
         const origGenerateUid = EntityManager.prototype.generateUid;
         EntityManager.prototype.generateUid = function () {
             if (!mod.session) {
                 return origGenerateUid.call(this);
             }
-            if (mod.session.isHost) {
-                if (this.nextUid % 2 !== 0) {
-                    this.nextUid += 1;
-                }
-            } else if (this.nextUid % 2 === 0) {
-                this.nextUid += 1;
+            const slot = mod.session.isHost ? 0 : mod.slot;
+            const want = ((slot % SLOT_STEP) + SLOT_STEP) % SLOT_STEP;
+            let uid = this.nextUid;
+            const residue = ((uid % SLOT_STEP) + SLOT_STEP) % SLOT_STEP;
+            if (residue !== want) {
+                uid += (want - residue + SLOT_STEP) % SLOT_STEP;
             }
-            const uid = this.nextUid;
-            this.nextUid += 2;
+            this.nextUid = uid + SLOT_STEP;
             return uid;
         };
 
@@ -963,33 +1038,73 @@ export default class CoopMod extends ModBase {
         this.setPanelMode(this.panelMode === "hidden" ? "open" : "hidden");
     }
 
+    /** Push mod-side state into a (possibly fresh) panel after game loads. */
+    syncPanelFromMod() {
+        const part = this.coopPart || this.hud;
+        if (!part) {
+            return;
+        }
+        part.setStatus(this.lastStatusText, this.lastStatusKind);
+        part.setConnected(this.session ? (this.session.isHost ? "host" : "client") : null);
+        if (this.lastInvites.length > 0) {
+            part.setInvites(this.lastInvites);
+        }
+        part.setSync(this.lastSyncText);
+        part.renderPeers(this.peers, this.net.clientId);
+        part.applyPanelMode(this.panelMode);
+    }
+
     onGameStarted(root) {
-        if (this.session) {
-            // New/loaded game while connected: keep the session, adopt the root.
-            this.session.root = root;
-            this.hookRootSignals(root);
+        if (!this.session) {
+            return;
+        }
+        const rootChanged = this.session.root !== root;
+        this.session.root = root;
+        this.hookRootSignals(root);
+        this.syncPanelFromMod();
+        if (rootChanged) {
+            // A new map mid-session: drop in-flight state and converge now
+            // instead of leaking cross-map ops for ~30s.
+            this.pendingOps = [];
+            this.flushScheduled = false;
+            this.deliveryCounts.clear();
+            this.deliveryQueue = [];
+            this.mismatches.clear();
             if (this.session.isHost) {
-                this.startHostTimers();
+                this.resyncAll();
             } else {
-                this.startClientTimers();
+                this.requestResync();
             }
         }
-        if (this.session) {
-            try {
-                root.dynamicTickrate.setTickRate(COOP_TICKRATE);
-            } catch {
-                // Root not fully initialized yet; constructor already fixed it
-            }
+        try {
+            root.dynamicTickrate.setTickRate(COOP_TICKRATE);
+        } catch {
+            // Root not fully initialized yet; constructor already fixed it
         }
     }
 
     hookRootSignals(root) {
+        if (this.hookedRoots.has(root)) {
+            return;
+        }
+        this.hookedRoots.add(root);
         root.signals.bulkOperationFinished.add(() => this.flushOps());
         root.signals.gameFrameStarted.add(() => this.drainDeliveries());
-        if (this._storyHook) {
-            // Avoid duplicates across restarts (signals are per-root anyway)
-            this._storyHook = null;
-        }
+        root.signals.aboutToDestruct.add(() => {
+            // Leaving/destroying the game ends the session: no live game
+            // means no hub-state, no resync answers, nothing to converge to.
+            if (this.session && this.session.root === root) {
+                try {
+                    this.net.send({ t: "bye" });
+                } catch {
+                    // Best effort
+                }
+                const wasHost = this.session.isHost;
+                this.endSession();
+                this.setStatus(wasHost ? "game closed (host left)" : "game closed", "warn");
+                this.renderPeers();
+            }
+        });
         root.signals.storyGoalCompleted.add(() => {
             if (this.session && this.session.isHost) {
                 this.broadcastHubState();
@@ -1005,6 +1120,9 @@ export default class CoopMod extends ModBase {
     }
 
     async hostGame(name) {
+        if (this.session) {
+            await this.leaveGame();
+        }
         const root = this.requireRoot();
         if (!root) {
             return;
@@ -1023,9 +1141,10 @@ export default class CoopMod extends ModBase {
         this.net.isHost = true;
         this.beginSession(root, true);
         this.net.connect("ws://127.0.0.1:" + status.port);
+        const invites = buildInvites(status.addresses, status.port);
+        this.lastInvites = invites;
         const part = this.hud;
         if (part) {
-            const invites = buildInvites(status.addresses, status.port);
             if (invites.length > 0) {
                 part.setInvites(invites);
             } else {
@@ -1037,6 +1156,9 @@ export default class CoopMod extends ModBase {
     }
 
     async joinGame(address, name) {
+        if (this.session) {
+            await this.leaveGame();
+        }
         const root = this.requireRoot();
         if (!root) {
             return;
@@ -1097,11 +1219,22 @@ export default class CoopMod extends ModBase {
         this.endTimers();
         this.session = { root, isHost };
         this.pendingOps = [];
+        this.flushScheduled = false;
         this.deliveryCounts.clear();
         this.deliveryQueue = [];
         this.lastCursorSent = null;
         this.peers.clear();
         this.mismatches.clear();
+        this.lastResync.clear();
+        this.awaitingWelcome = !isHost;
+        if (isHost) {
+            this.hostId = this.net.clientId;
+            this.slots.clear();
+            this.nextSlot = 1;
+        } else {
+            this.hostId = null;
+            this.slot = 1;
+        }
         this.lastSyncText = "-";
         // Self entry so the peer list always shows the local player
         this.peers.set(this.net.clientId, {
@@ -1130,6 +1263,7 @@ export default class CoopMod extends ModBase {
     }
 
     endSession() {
+        const root = this.session && this.session.root;
         this.endTimers();
         this.session = null;
         this.pendingOps = [];
@@ -1139,6 +1273,16 @@ export default class CoopMod extends ModBase {
         this.lastCursorSent = null;
         this.peers.clear();
         this.mismatches.clear();
+        this.lastResync.clear();
+        this.awaitingWelcome = false;
+        // Session is null now so the tickrate patch passes through
+        if (root) {
+            try {
+                root.dynamicTickrate.setTickRate(root.app.settings.getDesiredFps());
+            } catch {
+                // Root half-torn-down; nothing to restore
+            }
+        }
     }
 
     startHostTimers() {
@@ -1199,7 +1343,9 @@ export default class CoopMod extends ModBase {
     }
 
     setStatus(text, kind) {
-        const part = this.hud;
+        this.lastStatusText = text;
+        this.lastStatusKind = kind || null;
+        const part = this.coopPart || this.hud;
         if (part) {
             part.setStatus(text, kind);
         }
@@ -1254,6 +1400,7 @@ export default class CoopMod extends ModBase {
             if (id !== this.net.clientId && now - peer.lastSeen > PEER_EXPIRE_MS) {
                 this.peers.delete(id);
                 this.mismatches.delete(id);
+                this.lastResync.delete(id);
                 changed = true;
             }
         }
@@ -1445,6 +1592,13 @@ export default class CoopMod extends ModBase {
         if (!this.session || this.session.isHost) {
             return;
         }
+        const now = Date.now();
+        if (now - this.lastResyncRequest < RESYNC_COOLDOWN_MS) {
+            this.setSync("resync on cooldown…");
+            return;
+        }
+        this.lastResyncRequest = now;
+        this.awaitingWelcome = true;
         this.net.send({ t: "resync-request" });
         this.setSync("resync requested…");
     }
@@ -1454,7 +1608,13 @@ export default class CoopMod extends ModBase {
             return;
         }
         const trimmed = String(text).slice(0, 200);
-        this.net.send({ t: "chat", name: this.net.name, text: trimmed });
+        if (!this.net.send({ t: "chat", name: this.net.name, text: trimmed })) {
+            const part = this.coopPart || this.hud;
+            if (part) {
+                part.addChat("system", "not sent (disconnected)");
+            }
+            return;
+        }
         const part = this.hud;
         if (part) {
             part.addChat(this.net.name + " (you)", trimmed);
@@ -1474,6 +1634,11 @@ export default class CoopMod extends ModBase {
 
     flushOps() {
         this.flushScheduled = false;
+        if (this.awaitingWelcome) {
+            // Pre-snapshot ops are causally newer than the coming welcome;
+            // hold them and replay after the wipe instead of losing them.
+            return;
+        }
         const ops = this.pendingOps;
         this.pendingOps = [];
         // Offline ops are already applied locally; never replay them into a
@@ -1481,19 +1646,33 @@ export default class CoopMod extends ModBase {
         if (!this.session || ops.length === 0) {
             return;
         }
-        this.net.send({ t: "ops", seq: this.opSeq++, ops });
+        if (!this.net.send({ t: "ops", seq: this.opSeq++, ops })) {
+            // Socket down: requeue at the front, order preserved
+            this.pendingOps = ops.concat(this.pendingOps);
+        }
     }
 
     flushDeliveries() {
         if (!this.session || this.session.isHost || this.deliveryCounts.size === 0) {
             return;
         }
+        if (this.deliveryCounts.size > MAX_BATCH_KEYS) {
+            warn("deliver-batch too large, truncating");
+        }
         const batch = {};
+        let keys = 0;
         for (const [key, count] of this.deliveryCounts) {
+            if (keys++ >= MAX_BATCH_KEYS) {
+                break;
+            }
             batch[key] = count;
         }
-        this.deliveryCounts.clear();
-        this.net.send({ t: "deliver-batch", batch });
+        if (!this.net.send({ t: "deliver-batch", batch })) {
+            return; // Socket down: keep counts, retry on the next beat
+        }
+        for (const key of Object.keys(batch)) {
+            this.deliveryCounts.delete(key);
+        }
     }
 
     broadcastHubState() {
@@ -1568,6 +1747,7 @@ export default class CoopMod extends ModBase {
             case "bye":
                 this.peers.delete(message.from);
                 this.mismatches.delete(message.from);
+                this.lastResync.delete(message.from);
                 this.renderPeers();
                 return;
             case "welcome":
@@ -1577,14 +1757,27 @@ export default class CoopMod extends ModBase {
                 if (this.session.isHost && message.from !== this.net.clientId) {
                     return; // Host never applies welcomes from others
                 }
+                if (!this.session.isHost && message.from !== this.hostId && this.hostId !== null) {
+                    return; // Only the session host may snapshot us
+                }
                 if (!this.session.isHost) {
-                    // Welcomes only ever come from the host
+                    // First valid welcome elects the host; later ones must match
+                    this.hostId = message.from;
                     this.touchPeer(message.from, message.name, true);
+                    if (Number.isInteger(message.slot) && message.slot >= 0 && message.slot <= MAX_CLIENT_SLOTS) {
+                        this.slot = message.slot;
+                    }
                 }
                 this.applyWelcome(message.dump);
                 return;
             case "resync-request":
                 if (this.session.isHost) {
+                    const now = Date.now();
+                    if (now - (this.lastResync.get(message.from) || 0) < RESYNC_COOLDOWN_MS) {
+                        warn("resync-request throttled for", message.from);
+                        return;
+                    }
+                    this.lastResync.set(message.from, now);
                     this.sendWelcome(message.from);
                 }
                 return;
@@ -1613,9 +1806,13 @@ export default class CoopMod extends ModBase {
                 this.applyHubUpgrade(root, message);
                 return;
             case "hub-state":
-                if (!this.session.isHost && message.from) {
-                    this.touchPeer(message.from, message.name, true);
+                if (this.session.isHost) {
+                    return;
                 }
+                if (this.hostId !== null && message.from !== this.hostId) {
+                    return; // Only the session host is authoritative
+                }
+                this.touchPeer(message.from, message.name, true);
                 this.applyHubState(root, message);
                 return;
             case "deliver-batch":
@@ -1677,10 +1874,22 @@ export default class CoopMod extends ModBase {
             warn("welcome skipped - no live game");
             return;
         }
+        // Stable per-peer UID slots (host = 0); rejoins keep their slot.
+        let slot = null;
+        if (to !== "*" && this.session.isHost) {
+            if (!this.slots.has(to)) {
+                let s = this.nextSlot++;
+                if (s > MAX_CLIENT_SLOTS) {
+                    s = ((s - 1) % MAX_CLIENT_SLOTS) + 1;
+                }
+                this.slots.set(to, s);
+            }
+            slot = this.slots.get(to);
+        }
         try {
             const SavegameSerializer = shapez("SavegameSerializer");
             const dump = new SavegameSerializer().generateDumpFromGameRoot(this.session.root, false);
-            this.net.send({ t: "welcome", to, dump });
+            this.net.send({ t: "welcome", to, slot, dump });
             log("sent welcome dump to", to);
         } catch (ex) {
             warn("welcome dump failed", ex);
@@ -1692,23 +1901,49 @@ export default class CoopMod extends ModBase {
         if (!root) {
             return;
         }
+        // Don't teleport the player on every resync; the snapshot is about
+        // buildings, not where we look.
+        let cameraState = null;
+        try {
+            cameraState = root.camera.serialize();
+        } catch {
+            // Root partially ready; proceed without restoring
+        }
         try {
             this.clearRoot(root);
             const SavegameSerializer = shapez("SavegameSerializer");
             const result = new SavegameSerializer().deserialize(dump, root);
             if (result && result.isGood && !result.isGood()) {
-                warn("welcome deserialize failed:", result.reason);
-                this.setStatus("sync failed", "err");
-                return;
+                throw new Error("savegame invalid: " + result.reason);
+            }
+            if (cameraState) {
+                try {
+                    root.camera.deserialize(cameraState);
+                } catch {
+                    // Cosmetic; ignore
+                }
             }
             this.broadcastNothingJustResyncUid(root);
             this.setStatus("connected (co-op)", "ok");
             this.setSync("in sync");
             log("applied welcome dump");
         } catch (ex) {
-            warn("applyWelcome failed", ex);
-            this.setStatus("sync failed", "err");
+            warn("applyWelcome failed, requesting a fresh snapshot", ex);
+            this.welcomeFailures = (this.welcomeFailures || 0) + 1;
+            if (this.welcomeFailures > 3) {
+                this.setStatus("sync failed, use Req sync", "err");
+                return;
+            }
+            this.setStatus("sync failed, retrying…", "err");
+            this.lastResyncRequest = 0; // allow this one immediate retry
+            this.requestResync();
+            return;
         }
+        this.welcomeFailures = 0;
+        // Ops made while "syncing…" are causally newer than the snapshot
+        // (duplicates are skipped by UID); replay them instead of dropping.
+        this.awaitingWelcome = false;
+        this.flushOps();
     }
 
     clearRoot(root) {
@@ -1724,6 +1959,17 @@ export default class CoopMod extends ModBase {
                 root.entityMgr.destroyEntity(entity);
             }
             root.entityMgr.processDestroyList();
+            // Belt paths are rebuilt incrementally on entity add AND appended
+            // by deserializePaths — without clearing, every resync duplicates
+            // all belts and simulates them twice.
+            try {
+                const belt = root.systemMgr.systems.belt;
+                if (belt && Array.isArray(belt.beltPaths)) {
+                    belt.beltPaths.length = 0;
+                }
+            } catch {
+                // Non-fatal; belt system will reconcile on next update
+            }
         } finally {
             this.applyingRemote = false;
         }
@@ -1745,8 +1991,12 @@ export default class CoopMod extends ModBase {
     }
 
     applyOps(root, ops) {
-        if (ops.length === 0) {
+        if (!Array.isArray(ops) || ops.length === 0) {
             return;
+        }
+        if (ops.length > MAX_OPS_PER_MESSAGE) {
+            warn("ops batch too large, truncating", ops.length);
+            ops = ops.slice(0, MAX_OPS_PER_MESSAGE);
         }
         const SerializerInternal = shapez("SerializerInternal");
         const internal = new SerializerInternal();
@@ -1755,8 +2005,11 @@ export default class CoopMod extends ModBase {
             for (const op of ops) {
                 try {
                     if (op.k === "place") {
-                        if (root.entityMgr.findByUid(op.uid, false)) {
-                            continue; // Already applied (echo / retry)
+                        // Raw map check: findByUid hides queued-for-destroy
+                        // entities, which would let a crafted batch resurrect
+                        // a UID over a pending destroy.
+                        if (!op.entity || op.entity.uid !== op.uid || root.entityMgr.entities.has(op.uid)) {
+                            continue;
                         }
                         internal.deserializeEntity(root, op.entity);
                         const mgr = root.entityMgr;
@@ -1780,14 +2033,28 @@ export default class CoopMod extends ModBase {
     }
 
     applyHubUpgrade(root, message) {
+        const tiers = root.gameMode.getUpgrades()[message.upgradeId];
+        if (!tiers) {
+            warn("unknown upgrade", message.upgradeId);
+            return;
+        }
+        const target = Math.min(message.level | 0, tiers.length);
         this.applyingRemote = true;
         try {
-            const target = message.level || 0;
             let guard = 0;
             while (root.hubGoals.getUpgradeLevel(message.upgradeId) < target && guard++ < 50) {
                 if (!root.hubGoals.tryUnlockUpgrade(message.upgradeId)) {
                     break;
                 }
+            }
+            // The purchaser already paid: if funds lagged behind the
+            // broadcast (delivery batches arrive every 2s), force-converge
+            // instead of letting the next hub-state silently revert it.
+            let level = root.hubGoals.getUpgradeLevel(message.upgradeId);
+            while (level < target) {
+                root.hubGoals.upgradeLevels[message.upgradeId] = level + 1;
+                root.hubGoals.upgradeImprovements[message.upgradeId] += tiers[level].improvement;
+                level++;
             }
         } finally {
             this.applyingRemote = false;
@@ -1848,13 +2115,15 @@ export default class CoopMod extends ModBase {
         const root = this.session.root;
         this.applyingRemote = true;
         try {
-            for (let i = this.deliveryQueue.length - 1; i >= 0; --i) {
+            let budget = MAX_REPLAY_PER_FRAME;
+            for (let i = this.deliveryQueue.length - 1; i >= 0 && budget > 0; --i) {
                 const entry = this.deliveryQueue[i];
-                const n = Math.min(entry.perFrame, entry.remaining);
+                const n = Math.min(entry.perFrame, entry.remaining, budget);
                 for (let k = 0; k < n; ++k) {
                     root.hubGoals.handleDefinitionDelivered(entry.def);
                 }
                 entry.remaining -= n;
+                budget -= n;
                 if (entry.remaining <= 0) {
                     this.deliveryQueue.splice(i, 1);
                 }
