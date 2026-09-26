@@ -23,37 +23,45 @@ check:
 # Run the game in dev mode (devtools open) with the co-op mod loaded
 dev:
     $gulp = Start-Process powershell -ArgumentList "-NoLogo","-Command","npm run gulp" -WorkingDirectory "{{root}}" -PassThru; \
+    $code = 1; \
     try { \
         $up = $false; \
         for ($i = 0; $i -lt 240 -and -not $up; $i++) { \
             try { $c = New-Object Net.Sockets.TcpClient("127.0.0.1", 3005); $c.Close(); $up = $true } catch { Start-Sleep -Milliseconds 500 } \
         }; \
         if (-not $up) { throw "dev server did not come up on :3005" }; \
-        Push-Location "{{root}}/electron"; npm start -- --dev --load-mod "{{coop_mod}}" --watch; Pop-Location \
-    } finally { Stop-Process -Id $gulp.Id -ErrorAction SilentlyContinue }
+        Push-Location "{{root}}/electron"; npm start -- --dev --load-mod "{{coop_mod}}" --watch; $code = $LASTEXITCODE; Pop-Location \
+    } finally { taskkill /PID $gulp.Id /T /F >$null 2>&1 } \
+    if ($code -ne 0) { throw "electron exited with code $code" }
 
 # Run the game with the co-op mod loaded (no devtools)
 run:
     $gulp = Start-Process powershell -ArgumentList "-NoLogo","-Command","npm run gulp" -WorkingDirectory "{{root}}" -PassThru; \
+    $code = 1; \
     try { \
         $up = $false; \
         for ($i = 0; $i -lt 240 -and -not $up; $i++) { \
             try { $c = New-Object Net.Sockets.TcpClient("127.0.0.1", 3005); $c.Close(); $up = $true } catch { Start-Sleep -Milliseconds 500 } \
         }; \
         if (-not $up) { throw "dev server did not come up on :3005" }; \
-        Push-Location "{{root}}/electron"; npm start -- --load-mod "{{coop_mod}}"; Pop-Location \
-    } finally { Stop-Process -Id $gulp.Id -ErrorAction SilentlyContinue }
+        Push-Location "{{root}}/electron"; npm start -- --load-mod "{{coop_mod}}"; $code = $LASTEXITCODE; Pop-Location \
+    } finally { taskkill /PID $gulp.Id /T /F >$null 2>&1 } \
+    if ($code -ne 0) { throw "electron exited with code $code" }
 
 # Pack the co-op mod into a distributable .asar bundle
 mod:
+    $ErrorActionPreference = "Stop"; \
     New-Item -ItemType Directory -Force "{{root}}/dist-mods" | Out-Null; \
     node "{{root}}/node_modules/@electron/asar/bin/asar.js" pack "{{coop_mod}}" "{{coop_asar}}"; \
-    node "{{root}}/node_modules/@electron/asar/bin/asar.js" list "{{coop_asar}}"
+    if ($LASTEXITCODE -ne 0) { throw "asar pack failed" }; \
+    node "{{root}}/node_modules/@electron/asar/bin/asar.js" list "{{coop_asar}}"; \
+    if ($LASTEXITCODE -ne 0) { throw "asar list failed" }
 
 # Build a distributable app bundle with the co-op mod included (takes a while)
 package platform="win32" arch="x64": mod
     $ErrorActionPreference = "Stop"; \
     npm run package-{{platform}}-{{arch}}; \
+    if ($LASTEXITCODE -ne 0) { throw "package build failed" }; \
     $app = "{{root}}/build_output/standalone/shapez-{{platform}}-{{arch}}"; \
     if (-not (Test-Path $app)) { throw "expected package dir missing: $app" }; \
     if (-not (Test-Path "{{coop_asar}}")) { throw "co-op mod bundle missing: {{coop_asar}}" }; \
@@ -90,7 +98,9 @@ export platform="win32" arch="x64": (package platform arch)
 # Typecheck + lint the co-op code (main process + mod)
 lint:
     node "{{root}}/electron/node_modules/typescript/bin/tsc" --noEmit -p "{{root}}/electron"; \
+    if ($LASTEXITCODE -ne 0) { throw "typecheck failed" }; \
     node "{{root}}/node_modules/eslint/bin/eslint.js" mods/coop/entry.js electron/src/coop/; \
+    if ($LASTEXITCODE -ne 0) { throw "eslint failed" }; \
     Write-Host "lint OK"
 
 # Remove build outputs
