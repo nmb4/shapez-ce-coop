@@ -50,6 +50,8 @@ config.local.js
 build_output
 tmp
 
+dist-mods/
+
 src/js/built-temp
 translations/tmp
 gulp/additional_build_files
