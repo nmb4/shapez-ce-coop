@@ -103,6 +103,12 @@ lint:
     if ($LASTEXITCODE -ne 0) { throw "eslint failed" }; \
     Write-Host "lint OK"
 
+# Tail the co-op log file the game writes (%APPDATA%/shapez-ce/coop.log)
+logs lines="50":
+    $log = "$env:APPDATA/shapez-ce/coop.log"; \
+    if (-not (Test-Path $log)) { throw "no co-op log yet at $log (host or join a game first)" }; \
+    Get-Content $log -Tail {{lines}}
+
 # Remove build outputs
 clean:
     Remove-Item -Recurse -Force "{{root}}/build" -ErrorAction SilentlyContinue; \

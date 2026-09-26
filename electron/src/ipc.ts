@@ -1,5 +1,6 @@
 import { BrowserWindow, IpcMainInvokeEvent, ipcMain } from "electron";
 import { CoopHostManager, CoopStatus } from "./coop/manager.js";
+import type { CoopLogger } from "./coop/logger.js";
 import { FsJob, FsJobHandler } from "./fsjob.js";
 import { ModLoader } from "./mods/loader.js";
 
@@ -7,10 +8,12 @@ export class IpcHandler {
     private readonly savesHandler = new FsJobHandler("saves");
     private readonly modLoader: ModLoader;
     private readonly coop: CoopHostManager;
+    private readonly coopLog: CoopLogger;
 
-    constructor(modLoader: ModLoader, coop: CoopHostManager) {
+    constructor(modLoader: ModLoader, coop: CoopHostManager, coopLog: CoopLogger) {
         this.modLoader = modLoader;
         this.coop = coop;
+        this.coopLog = coopLog;
     }
 
     install(window: BrowserWindow) {
@@ -25,6 +28,11 @@ export class IpcHandler {
         });
         ipcMain.handle("coop-stop", (): Promise<CoopStatus> => this.coop.stop());
         ipcMain.handle("coop-status", (): CoopStatus => this.coop.status());
+        ipcMain.handle("coop-log", (_event: IpcMainInvokeEvent, level: unknown, text: unknown) => {
+            if (typeof level === "string" && typeof text === "string") {
+                this.coopLog.write(level, text);
+            }
+        });
 
         // Not implemented
         // ipcMain.handle("open-mods-folder", ...)

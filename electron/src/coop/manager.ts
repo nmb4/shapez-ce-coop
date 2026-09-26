@@ -1,6 +1,7 @@
 import { BrowserWindow } from "electron";
 import { getLanAddresses, LanInterface } from "./addresses.js";
 import { CoopWsServer } from "./ws_server.js";
+import type { CoopLogger } from "./logger.js";
 
 export const COOP_DEFAULT_PORT = 47821;
 
@@ -26,12 +27,13 @@ export class CoopHostManager {
     private port = 0;
     private pingTimer: NodeJS.Timeout | null = null;
 
-    constructor() {
+    constructor(private readonly log?: CoopLogger) {
         this.server.onMessage = (peer, text) => {
             // Relay to everyone except the sender (includes host renderer)
             this.server.broadcast(text, peer.id);
         };
         this.server.onPeersChanged = peers => {
+            this.log?.write("info", `coop relay peers: ${peers}`);
             this.notifyPeers(peers);
         };
     }
@@ -54,6 +56,7 @@ export class CoopHostManager {
     async start(port: number = COOP_DEFAULT_PORT): Promise<CoopStatus> {
         if (!this.server.isRunning()) {
             this.port = await this.server.start(port);
+            this.log?.write("info", `coop relay started on :${this.port}`);
             this.pingTimer ??= setInterval(() => {
                 this.server.broadcast(JSON.stringify({ t: "ping", ts: Date.now() }));
             }, 25000);
@@ -69,6 +72,7 @@ export class CoopHostManager {
         }
         await this.server.stop();
         this.port = 0;
+        this.log?.write("info", "coop relay stopped");
         this.notifyPeers(0);
         return this.status();
     }

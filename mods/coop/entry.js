@@ -47,11 +47,48 @@ const DELIVERY_QUEUE_CAP = 50000;
 
 let activeMod = null;
 
+function formatLogArgs(args) {
+    return Array.from(args)
+        .map(arg => {
+            if (typeof arg === "string") {
+                return arg;
+            }
+            if (arg instanceof Error) {
+                return arg.stack || arg.message;
+            }
+            try {
+                return JSON.stringify(arg);
+            } catch {
+                return String(arg);
+            }
+        })
+        .join(" ");
+}
+
+/** Best-effort file sink: the main process appends to <userData>/coop.log.
+ *  Never throws, never blocks; logging must not break the game. */
+function shipLogToFile(level, text) {
+    try {
+        if (typeof ipcRenderer !== "undefined" && ipcRenderer.invoke) {
+            const pending = ipcRenderer.invoke("coop-log", level, text);
+            if (pending && pending.catch) {
+                pending.catch(() => {});
+            }
+        }
+    } catch {
+        // Ignore: console output remains
+    }
+}
+
 function log(...args) {
-    console.log("[coop]", ...args);
+    const line = "[coop] " + formatLogArgs(args);
+    console.log(line);
+    shipLogToFile("info", line);
 }
 function warn(...args) {
-    console.warn("[coop]", ...args);
+    const line = "[coop] " + formatLogArgs(args);
+    console.warn(line);
+    shipLogToFile("warn", line);
 }
 
 /** Compact "belt 120→119" style diff of two "code:count,..." strings. */
@@ -1209,6 +1246,8 @@ export default class CoopMod extends ModBase {
         this.net.connect("ws://127.0.0.1:" + status.port);
         const invites = buildInvites(status.addresses, status.port);
         this.lastInvites = invites;
+        const ownVersion = (this.metadata && this.metadata.version) || "?";
+        log("hosting co-op v" + ownVersion + " on port", status.port, "invites:", invites.map(i => i.url).join(","));
         const part = this.hud;
         if (part) {
             if (invites.length > 0) {
@@ -1218,7 +1257,6 @@ export default class CoopMod extends ModBase {
             }
         }
         this.setStatus("hosting :" + status.port, "ok");
-        log("hosting on port", status.port);
     }
 
     async joinGame(address, name) {
@@ -1240,6 +1278,7 @@ export default class CoopMod extends ModBase {
         this.net.isHost = false;
         this.beginSession(root, false);
         this.net.connect(url);
+        log("joining co-op v" + ((this.metadata && this.metadata.version) || "?"), "at", url);
         this.setStatus("joining…", "warn");
     }
 

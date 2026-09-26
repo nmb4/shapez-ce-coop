@@ -76,6 +76,13 @@ Allow inbound TCP on port 47821 through the firewall.
 - Chat: `Enter` sends and releases the box, `Escape` or clicking the map
   releases it too.
 
+## Bug reports
+
+Every co-op event (sessions, joins, drift diffs, resyncs, errors) is
+appended to `%APPDATA%/shapez-ce/coop.log` (rotated at 2 MB). After
+something weird happens, run `just logs` (or `just logs 200`) and share
+the output.
+
 ## Known limitations
 
 - 2 players recommended. With 3+, two clients can rarely pick the same

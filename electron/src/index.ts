@@ -1,6 +1,7 @@
 import { BrowserWindow, app, shell } from "electron";
 import path from "node:path";
 import { defaultWindowTitle, pageUrl, switches } from "./config.js";
+import { CoopLogger } from "./coop/logger.js";
 import { CoopHostManager } from "./coop/manager.js";
 import { IpcHandler } from "./ipc.js";
 import { ModLoader } from "./mods/loader.js";
@@ -22,8 +23,9 @@ if (!app.requestSingleInstanceLock()) {
 
 const modLoader = new ModLoader();
 const modProtocol = new ModProtocolHandler(modLoader);
-const coopHost = new CoopHostManager();
-const ipc = new IpcHandler(modLoader, coopHost);
+const coopLog = new CoopLogger();
+const coopHost = new CoopHostManager(coopLog);
+const ipc = new IpcHandler(modLoader, coopHost, coopLog);
 
 function createWindow() {
     // The protocol can only be handled after "ready" event
