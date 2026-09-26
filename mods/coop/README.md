@@ -38,7 +38,12 @@ Allow inbound TCP on port 47821 through the firewall.
 - Live map cursors with AFK ghosts.
 - Drift protection: structural checksums every 15s; the host pushes a
   full snapshot after two consecutive mismatches (max one auto-resync
-  per peer per minute). Either side can also trigger a manual resync.
+  per peer per minute, with a per-building diff shown in the panel).
+  Either side can also trigger a manual resync.
+- Note: trash cans accept items from all four sides, so nearby belts
+  prefer pointing into them. That's base-game behavior, not a sync bug —
+  but if belts ever disagree between peers, the resync line names the
+  differing buildings.
 - Up to 8 players (host + 7 UID slots); each session is trusted-LAN
   (no auth/encryption).
 - Drops and crashes are handled gracefully: peers age out within ~10s,

@@ -54,6 +54,37 @@ function warn(...args) {
     console.warn("[coop]", ...args);
 }
 
+/** Compact "belt 120→119" style diff of two "code:count,..." strings. */
+function summarizeCodeDiff(ownCodes, peerCodes) {
+    const parse = text => {
+        const map = new Map();
+        for (const part of String(text || "").split(",")) {
+            const [code, count] = part.split(":");
+            if (code) {
+                map.set(code, Number(count) | 0);
+            }
+        }
+        return map;
+    };
+    const own = parse(ownCodes);
+    const peer = parse(peerCodes);
+    const diffs = [];
+    for (const code of new Set([...own.keys(), ...peer.keys()])) {
+        const delta = (peer.get(code) || 0) - (own.get(code) || 0);
+        if (delta !== 0) {
+            diffs.push({ code, delta });
+        }
+    }
+    diffs.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+    if (diffs.length === 0) {
+        return "no count diff";
+    }
+    return diffs
+        .slice(0, 3)
+        .map(d => d.code + " " + (d.delta > 0 ? "+" : "") + d.delta)
+        .join(", ");
+}
+
 /** Resolves a global export published by ModLoader.exposeExports. */
 function shapez(name) {
     const value = window.shapez[name];
@@ -79,7 +110,7 @@ function fnv1aHex(text) {
  * per-entity identity tuples so moves, rotations, variant swaps and
  * same-UID collisions are detected.
  */
-function computeSyncHash(root) {
+function computeSyncSummary(root) {
     const upgradeParts = [];
     const upgrades = root.hubGoals.upgradeLevels || {};
     for (const id of Object.keys(upgrades).sort()) {
@@ -98,6 +129,18 @@ function computeSyncHash(root) {
         }
     }
     entityParts.sort();
+    const codeCounts = {};
+    for (const entity of root.entityMgr.entities.values()) {
+        try {
+            const code = String(entity.components.StaticMapEntity.code);
+            codeCounts[code] = (codeCounts[code] || 0) + 1;
+        } catch {
+            // Counted in the tuple fallback already
+        }
+    }
+    const codeParts = Object.keys(codeCounts)
+        .sort()
+        .map(code => code + ":" + codeCounts[code]);
     const summary = {
         seed: root.map.seed,
         n: entityParts.length,
@@ -105,7 +148,7 @@ function computeSyncHash(root) {
         upgrades: upgradeParts.join(","),
         entities: entityParts.join(";"),
     };
-    return fnv1aHex(JSON.stringify(summary));
+    return { hash: fnv1aHex(JSON.stringify(summary)), codes: codeParts.join(",") };
 }
 
 /** Normalize status.addresses (string[] from old builds or {name,address}[]). */
@@ -1491,7 +1534,13 @@ export default class CoopMod extends ModBase {
             return;
         }
         try {
-            this.net.send({ t: "sync-check", hash: computeSyncHash(this.session.root), seq: this.opSeq });
+            const summary = computeSyncSummary(this.session.root);
+            this.net.send({
+                t: "sync-check",
+                hash: summary.hash,
+                codes: summary.codes,
+                seq: this.opSeq,
+            });
         } catch (ex) {
             warn("sync-check failed", ex);
         }
@@ -1653,6 +1702,49 @@ export default class CoopMod extends ModBase {
             }
         }
         return count;
+    }
+
+    /** Recompute every belt direction against the complete map.
+     *  Op batches and snapshots apply entities one by one; intermediate
+     *  neighbor recomputes can strand a belt with a direction decided from
+     *  a partial neighborhood. A final pass over all belts converges both
+     *  peers to the same pure function of the same map. Runs after
+     *  snapshots only (steady-state batches self-converge on arrival). */
+    reconvergeBelts(root) {
+        let system = null;
+        try {
+            system = root.systemMgr.systems.belt;
+        } catch {
+            return 0;
+        }
+        if (!system) {
+            return 0;
+        }
+        let fixed = 0;
+        const belts = [];
+        try {
+            for (const entity of root.entityMgr.entities.values()) {
+                if (entity.components && entity.components.Belt) {
+                    belts.push(entity);
+                }
+            }
+        } catch {
+            return 0;
+        }
+        this.applyingRemote = true;
+        try {
+            for (const belt of belts) {
+                try {
+                    system.updateSurroundingBeltPlacement(belt);
+                } catch (ex) {
+                    warn("belt reconverge failed", ex);
+                }
+            }
+            fixed = belts.length;
+        } finally {
+            this.applyingRemote = false;
+        }
+        return fixed;
     }
 
     /** Client: ask the host for a full snapshot. */
@@ -1904,12 +1996,12 @@ export default class CoopMod extends ModBase {
         const root = this.session.root;
         let own;
         try {
-            own = computeSyncHash(root);
+            own = computeSyncSummary(root);
         } catch (ex) {
             warn("sync hash failed", ex);
             return;
         }
-        if (message.hash === own) {
+        if (message.hash === own.hash) {
             this.mismatches.set(message.from, 0);
             this.setSync("in sync");
             return;
@@ -1928,13 +2020,25 @@ export default class CoopMod extends ModBase {
         }
         this.lastResync.set(message.from, now);
         this.mismatches.set(message.from, 0);
-        log("auto-resyncing diverged peer", message.from);
+        const driftDiff = summarizeCodeDiff(own.codes, message.codes);
+        log("auto-resyncing diverged peer", message.from, "own:", own.codes, "peer:", message.codes);
+        try {
+            window.__coopLastDrift = {
+                at: new Date().toISOString(),
+                peer: message.from,
+                diff: driftDiff,
+                ownCodes: own.codes,
+                peerCodes: message.codes || "?",
+            };
+        } catch {
+            // Diagnostics only
+        }
         this.sendWelcome(message.from);
         const part = this.hud;
         if (part) {
-            part.addChat("system", "resynced diverged peer " + (message.name || message.from));
+            part.addChat("system", "resynced diverged peer " + (message.name || message.from) + " (" + driftDiff + ")");
         }
-        this.setSync("resynced a peer");
+        this.setSync("resynced (" + driftDiff + ")");
     }
 
     sendWelcome(to) {
@@ -1992,6 +2096,7 @@ export default class CoopMod extends ModBase {
                 }
             }
             this.broadcastNothingJustResyncUid(root);
+            this.reconvergeBelts(root);
             this.setStatus("connected (co-op)", "ok");
             this.setSync("in sync");
             log("applied welcome dump");

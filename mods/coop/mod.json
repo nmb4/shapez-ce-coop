@@ -5,6 +5,6 @@
     "name": "Co-op (built-in host)",
     "description": "Experimental cooperative multiplayer: shared map, building ops and hub progress sync over a built-in LAN relay. See README.md.",
     "authors": [{ "name": "shapez CE contributors" }],
-    "version": "0.7.0",
+    "version": "0.7.1",
     "savegameResident": false
 }
