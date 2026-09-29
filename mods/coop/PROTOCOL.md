@@ -162,7 +162,8 @@ Batches are capped at 256 keys with a bounded per-frame replay budget.
 
 ### `ping` (relay → all, every 25s)
 
-Keep-alive. Ignore.
+Versionless relay keep-alive by design; ignored before the version
+check (never logged as a version mismatch).
 
 ## Main-process IPC (renderer ↔ Electron host)
 

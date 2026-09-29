@@ -40,9 +40,9 @@ Allow inbound TCP on port 47821 through the firewall.
   smoothly so throughput goals and statistics see correct rates),
   pinned shapes + waypoints (via full-state join sync).
 - Live map cursors with AFK ghosts.
-- Drift protection: structural checksums every 15s; the host pushes a
-  full snapshot after two consecutive mismatches (max one auto-resync
-  per peer per minute, with a per-building diff shown in the panel).
+- Drift protection: structural checksums every 15s; quiet divergence
+  resyncs after 2 beats, divergence during active building after ~90s
+  (in-flight ops, not drift). The panel names the differing buildings.
   Either side can also trigger a manual resync.
 - Note: trash cans accept items from all four sides, so nearby belts
   prefer pointing into them. That's base-game behavior, not a sync bug —

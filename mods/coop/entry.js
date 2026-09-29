@@ -938,6 +938,7 @@ export default class CoopMod extends ModBase {
         this.pendingOps = [];
         this.flushScheduled = false;
         this.opSeq = 0;
+        this.lastOpActivity = 0; // last local/remote structural change (ms)
         this.versionWarned = new Set();
         this.slot = 1; // UID slot (0 = host); assigned by welcome, 1 pre-join
         this.hostId = null; // clientId of the session host, once known
@@ -1834,6 +1835,7 @@ export default class CoopMod extends ModBase {
 
     queueOp(op) {
         this.pendingOps.push(op);
+        this.lastOpActivity = Date.now();
         if (this.flushScheduled) {
             return;
         }
@@ -1900,6 +1902,9 @@ export default class CoopMod extends ModBase {
     handleMessage(message) {
         if (!this.session) {
             return;
+        }
+        if (message.t === "ping") {
+            return; // Relay keep-alive, versionless by design
         }
         if (message.v !== COOP_VERSION) {
             warn("dropping message with wrong version", message.v);
@@ -2075,9 +2080,13 @@ export default class CoopMod extends ModBase {
         }
         const count = (this.mismatches.get(message.from) || 0) + 1;
         this.mismatches.set(message.from, count);
-        if (count < 2) {
-            // One mismatch can be an in-flight op; wait for the next check.
-            this.setSync("checking…");
+        // During active building both sides legitimately disagree between
+        // beats (ops in flight). Only treat quiet divergence as drift, but
+        // never let a persistent mismatch ride longer than ~90s.
+        const busy = Date.now() - this.lastOpActivity < 10000;
+        const needed = busy ? 6 : 2;
+        if (count < needed) {
+            this.setSync(busy ? "building, checking…" : "checking…");
             return;
         }
         const now = Date.now();
@@ -2088,7 +2097,7 @@ export default class CoopMod extends ModBase {
         this.lastResync.set(message.from, now);
         this.mismatches.set(message.from, 0);
         const driftDiff = summarizeCodeDiff(own.codes, message.codes);
-        log("auto-resyncing diverged peer", message.from, "own:", own.codes, "peer:", message.codes);
+        log("auto-resyncing diverged peer", message.from, "diff:", driftDiff, "own:", own.codes, "peer:", message.codes);
         try {
             window.__coopLastDrift = {
                 at: new Date().toISOString(),
@@ -2215,17 +2224,9 @@ export default class CoopMod extends ModBase {
         } catch {
             // Best effort
         }
-        // Belt paths are rebuilt incrementally on entity add AND appended
-        // by deserializePaths — without clearing, every resync duplicates
-        // all belts and simulates them twice.
-        try {
-            const belt = root.systemMgr.systems.belt;
-            if (belt && Array.isArray(belt.beltPaths)) {
-                belt.beltPaths.length = 0;
-            }
-        } catch {
-            // Non-fatal; belt system will reconcile on next update
-        }
+        // NOTE: belt paths are NOT cleared here; deserializePaths (which
+        // always follows in the same dump apply) owns that invariant, so
+        // paths end up exactly as serialized — never duplicated.
     }
 
     broadcastNothingJustResyncUid(root) {
@@ -2251,6 +2252,7 @@ export default class CoopMod extends ModBase {
             warn("ops batch too large, truncating", ops.length);
             ops = ops.slice(0, MAX_OPS_PER_MESSAGE);
         }
+        this.lastOpActivity = Date.now();
         const SerializerInternal = shapez("SerializerInternal");
         const internal = new SerializerInternal();
         this.applyingRemote = true;
