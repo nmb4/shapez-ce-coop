@@ -44,6 +44,41 @@ const CURSOR_EXPIRE_MS = 2500;
 // (and throughput goals) see smooth rates instead of one spike.
 const DELIVERY_SPREAD_FRAMES = 120;
 const DELIVERY_QUEUE_CAP = 50000;
+// Persisted player identity (shared by Host + Join so the name only has to
+// be typed once). localStorage survives reloads and new savegames.
+const COOP_NAME_KEY = "shapez-coop:playerName";
+const COOP_ADDR_KEY = "shapez-coop:lastJoinAddress";
+
+function loadStoredCoopValue(key) {
+    try {
+        if (typeof localStorage === "undefined") {
+            return "";
+        }
+        return (localStorage.getItem(key) || "").trim();
+    } catch {
+        return "";
+    }
+}
+
+function saveStoredCoopValue(key, value) {
+    try {
+        if (typeof localStorage === "undefined") {
+            return;
+        }
+        const clean = String(value || "").trim();
+        if (clean) {
+            localStorage.setItem(key, clean);
+        } else {
+            localStorage.removeItem(key);
+        }
+    } catch {
+        // Storage unavailable (private mode, etc.): session still works
+    }
+}
+
+function loadStoredCoopName() {
+    return loadStoredCoopValue(COOP_NAME_KEY);
+}
 
 let activeMod = null;
 
@@ -319,7 +354,7 @@ class CoopNet {
         this.socket = null;
         this.url = null;
         this.clientId = "c" + Math.random().toString(36).slice(2, 10);
-        this.name = "Player";
+        this.name = loadStoredCoopName() || "Player";
         this.isHost = false;
         this.connected = false;
         this.onMessage = null;
@@ -492,9 +527,38 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
         this.inviteSelect = query(".coopInviteSel");
         this.hostButton = query(".coopHost");
         this.joinButton = query(".coopJoin");
+        this.nameInput = query(".coopName");
+        this.addrInput = query(".coopAddr");
         const versionEl = query(".coopVersion");
         if (versionEl && activeMod && activeMod.metadata && activeMod.metadata.version) {
             versionEl.textContent = " v" + activeMod.metadata.version;
+        }
+        // Remember the name (and last join address) across games/reloads:
+        // one shared name field feeds both Host and Join.
+        if (this.nameInput) {
+            const storedName = loadStoredCoopName();
+            const netName = activeMod && activeMod.net ? activeMod.net.name : "";
+            this.nameInput.value = storedName || (netName && netName !== "Player" ? netName : "");
+            this.nameInput.addEventListener("input", event => {
+                const clean = String(event.target.value || "")
+                    .trim()
+                    .slice(0, 24);
+                saveStoredCoopValue(COOP_NAME_KEY, clean);
+                if (activeMod && activeMod.net && clean) {
+                    activeMod.net.name = clean;
+                    const self = activeMod.peers && activeMod.peers.get(activeMod.net.clientId);
+                    if (self) {
+                        self.name = clean;
+                        activeMod.renderPeers();
+                    }
+                }
+            });
+        }
+        if (this.addrInput) {
+            this.addrInput.value = loadStoredCoopValue(COOP_ADDR_KEY) || "";
+            this.addrInput.addEventListener("input", event => {
+                saveStoredCoopValue(COOP_ADDR_KEY, event.target.value || "");
+            });
         }
 
         // Plain native clicks for the pure UI toggles: no sounds, no game
@@ -520,9 +584,9 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
                 activeMod.setPanelMode("open");
             }
         });
-        this.trackClicks(this.hostButton, () => activeMod && activeMod.hostGame(query(".coopName").value));
-        this.trackClicks(query(".coopJoin"), () =>
-            activeMod && activeMod.joinGame(query(".coopAddr").value, query(".coopName").value)
+        this.trackClicks(this.hostButton, () => activeMod && activeMod.hostGame(this.nameInput && this.nameInput.value));
+        this.trackClicks(this.joinButton, () =>
+            activeMod && activeMod.joinGame(this.addrInput && this.addrInput.value, this.nameInput && this.nameInput.value)
         );
         this.trackClicks(query(".coopLeave"), () => activeMod && activeMod.leaveGame());
         this.trackClicks(query(".coopResync"), () => activeMod && activeMod.resyncAll());
@@ -1185,6 +1249,18 @@ export default class CoopMod extends ModBase {
         if (!part) {
             return;
         }
+        // Fresh HUD parts (new game / reload) start with empty fields:
+        // refill the remembered name + join address.
+        try {
+            if (part.nameInput && !part.nameInput.value) {
+                part.nameInput.value = loadStoredCoopName() || (this.net.name !== "Player" ? this.net.name : "");
+            }
+            if (part.addrInput && !part.addrInput.value) {
+                part.addrInput.value = loadStoredCoopValue(COOP_ADDR_KEY) || "";
+            }
+        } catch {
+            // Cosmetic only; panel still works
+        }
         part.setStatus(this.lastStatusText, this.lastStatusKind);
         part.setConnected(this.session ? (this.session.isHost ? "host" : "client") : null);
         if (this.lastInvites.length > 0) {
@@ -1260,6 +1336,18 @@ export default class CoopMod extends ModBase {
         });
     }
 
+    /** Normalize + persist the shared player name for Host and Join. */
+    rememberName(name) {
+        const clean = String(name || "")
+            .trim()
+            .slice(0, 24);
+        if (clean) {
+            this.net.name = clean;
+            saveStoredCoopValue(COOP_NAME_KEY, clean);
+        }
+        return clean;
+    }
+
     async hostGame(name) {
         if (this.session) {
             await this.leaveGame();
@@ -1268,9 +1356,7 @@ export default class CoopMod extends ModBase {
         if (!root) {
             return;
         }
-        if (name) {
-            this.net.name = name;
-        }
+        this.rememberName(name);
         let status;
         try {
             status = await ipcRenderer.invoke("coop-start", COOP_DEFAULT_PORT);
@@ -1313,9 +1399,8 @@ export default class CoopMod extends ModBase {
             this.setStatus("invalid join code — check address and port (1-65535)", "err");
             return;
         }
-        if (name) {
-            this.net.name = name;
-        }
+        this.rememberName(name);
+        saveStoredCoopValue(COOP_ADDR_KEY, address);
         this.net.isHost = false;
         if (!this.net.connect(url)) {
             this.setStatus("invalid join code — check address and port (1-65535)", "err");
