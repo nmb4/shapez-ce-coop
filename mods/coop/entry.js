@@ -251,7 +251,32 @@ function peerColor(clientId) {
 }
 
 /** Accepts shapez://ip:port, ws(s)://, http(s)://, bare host or host:port. */
-function parseJoinInput(input) {    if (!input) {
+function parseJoinInput(input) {
+    const validateWsUrl = url => {
+        // Reject out-of-range ports explicitly: WHATWG URL parsing does not
+        // reliably throw for them, but the WebSocket constructor does (which
+        // previously surfaced as an unhandled rejection).
+        const portMatch = url.match(/:(\d+)(?:\/[^]*)?$/);
+        if (portMatch) {
+            const port = Number(portMatch[1]);
+            if (!Number.isInteger(port) || port < 1 || port > 65535) {
+                return null;
+            }
+        }
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+                return null;
+            }
+            if (!parsed.hostname) {
+                return null;
+            }
+        } catch {
+            return null;
+        }
+        return url;
+    };
+    if (!input) {
         return null;
     }
     let text = String(input).trim();
@@ -264,13 +289,13 @@ function parseJoinInput(input) {    if (!input) {
         const scheme = schemeMatch[1].toLowerCase();
         rest = schemeMatch[2];
         if (scheme === "http") {
-            return "ws://" + rest;
+            return validateWsUrl("ws://" + rest);
         }
         if (scheme === "https") {
-            return "wss://" + rest;
+            return validateWsUrl("wss://" + rest);
         }
         if (scheme === "ws" || scheme === "wss" || scheme === "shapez") {
-            return (scheme === "shapez" ? "ws://" : scheme + "://") + rest;
+            return validateWsUrl((scheme === "shapez" ? "ws://" : scheme + "://") + rest);
         }
         return null;
     }
@@ -279,7 +304,7 @@ function parseJoinInput(input) {    if (!input) {
         if (!/:\d+$/.test(rest) || rest.endsWith("]")) {
             rest += ":" + COOP_DEFAULT_PORT;
         }
-        return "ws://" + rest;
+        return validateWsUrl("ws://" + rest);
     }
     return null;
 }
@@ -304,9 +329,20 @@ class CoopNet {
 
     connect(url) {
         this.disconnect();
+        let socket;
+        try {
+            socket = new WebSocket(url);
+        } catch (ex) {
+            // Invalid URL (e.g. out-of-range port): never let this escape as
+            // an unhandled rejection. Caller shows "invalid join code".
+            warn("invalid server URL", url);
+            this.url = null;
+            this.socket = null;
+            this.connected = false;
+            return false;
+        }
         this.url = url;
         log("connecting to", url);
-        const socket = new WebSocket(url);
         this.socket = socket;
         socket.onopen = () => {
             if (this.socket !== socket) {
@@ -358,6 +394,7 @@ class CoopNet {
             // onclose follows; surface it through the hud status
             warn("socket error");
         };
+        return true;
     }
 
     disconnect() {
@@ -1243,8 +1280,11 @@ export default class CoopMod extends ModBase {
             return;
         }
         this.net.isHost = true;
+        if (!this.net.connect("ws://127.0.0.1:" + status.port)) {
+            this.setStatus("host failed (see console)", "err");
+            return;
+        }
         this.beginSession(root, true);
-        this.net.connect("ws://127.0.0.1:" + status.port);
         const invites = buildInvites(status.addresses, status.port);
         this.lastInvites = invites;
         const ownVersion = (this.metadata && this.metadata.version) || "?";
@@ -1270,15 +1310,18 @@ export default class CoopMod extends ModBase {
         }
         const url = parseJoinInput(address);
         if (!url) {
-            this.setStatus("invalid join code", "err");
+            this.setStatus("invalid join code — check address and port (1-65535)", "err");
             return;
         }
         if (name) {
             this.net.name = name;
         }
         this.net.isHost = false;
+        if (!this.net.connect(url)) {
+            this.setStatus("invalid join code — check address and port (1-65535)", "err");
+            return;
+        }
         this.beginSession(root, false);
-        this.net.connect(url);
         log("joining co-op v" + ((this.metadata && this.metadata.version) || "?"), "at", url);
         this.setStatus("joining…", "warn");
     }
