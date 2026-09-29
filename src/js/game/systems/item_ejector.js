@@ -226,6 +226,10 @@ export class ItemEjectorSystem extends GameSystemWithFilter {
         const beltComp = receiver.components.Belt;
         if (beltComp) {
             const path = beltComp.assignedPath;
+            if (!path) {
+                // Stale target (see belt_path.js guard); item waits a tick.
+                return false;
+            }
             assert(path, "belt has no path");
             if (path.tryAcceptItem(item)) {
                 return true;

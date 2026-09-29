@@ -251,6 +251,12 @@ export class BeltPath extends BasicSerializableObject {
                     entity: targetEntity,
                     acceptor: item => {
                         const path = targetBeltComp.assignedPath;
+                        if (!path) {
+                            // Stale target (entity left its path without a
+                            // recompute). Asserts are compiled out in prod,
+                            // so guard: the item simply waits for next tick.
+                            return false;
+                        }
                         assert(path, "belt has no path");
                         return path.tryAcceptItem(item);
                     },

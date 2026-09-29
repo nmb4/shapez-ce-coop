@@ -87,6 +87,12 @@ export class BeltSystem extends GameSystem {
             return "Belt paths are not an array: " + typeof data;
         }
 
+        // Clear first: during live re-syncs the paths were already rebuilt
+        // incrementally as entities deserialized (gameInitialized is true),
+        // so appending would simulate every belt twice. During normal loads
+        // this is a no-op on the empty list.
+        this.beltPaths.length = 0;
+
         for (let i = 0; i < data.length; ++i) {
             const path = BeltPath.fromSerialized(this.root, data[i]);
             // If path is a string, that means its an error
