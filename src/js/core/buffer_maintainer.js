@@ -53,6 +53,16 @@ export class BufferMaintainer {
         return stats;
     }
 
+    /** Invalidate cached map drawings when a live root loads another world. */
+    clear() {
+        for (const subCache of this.cache.values()) {
+            for (const entry of subCache.values()) {
+                freeCanvas(entry.canvas);
+            }
+        }
+        this.cache.clear();
+    }
+
     /**
      * Goes to the next buffer iteration, clearing all buffers which were not used
      * for a few iterations

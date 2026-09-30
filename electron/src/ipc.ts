@@ -28,6 +28,13 @@ export class IpcHandler {
         });
         ipcMain.handle("coop-stop", (): Promise<CoopStatus> => this.coop.stop());
         ipcMain.handle("coop-status", (): CoopStatus => this.coop.status());
+        // Chromium throttles background timers by default. A co-op renderer
+        // must continue publishing/receiving factory state while covered.
+        ipcMain.handle("coop-active", (_event: IpcMainInvokeEvent, active: unknown) => {
+            if (typeof active === "boolean" && !window.isDestroyed()) {
+                window.webContents.setBackgroundThrottling(!active);
+            }
+        });
         ipcMain.handle("coop-log", (_event: IpcMainInvokeEvent, level: unknown, text: unknown) => {
             if (typeof level === "string" && typeof text === "string") {
                 this.coopLog.write(level, text);

@@ -1,30 +1,26 @@
-// shapez CE co-op mod (v1): host-authoritative shared-map co-op.
-//
-// Design (see PROTOCOL.md):
-//  - Transport: native WebSocket to the built-in relay in the Electron main
-//    process (electron/src/coop/). The relay is dumb broadcast; the host's
-//    own renderer connects as a client too.
-//  - Join: host sends a full savegame dump (`welcome`); the client wipes its
-//    live root and deserializes it (same path as savegame loading).
-//  - Steady state: building place/delete ops are replicated in order.
-//    Blueprint pastes are batched via the bulk-operation signal.
-//  - Hub: host-authoritative. Clients batch their hub deliveries to the host,
-//    the host replays them through HubGoals.handleDefinitionDelivered and
-//    broadcasts hub-state every few seconds + on goal completion.
-//  - Determinism aid: fixed 60 Hz tick while a session is active, and
-//    UID slots (stride 8: host 0, clients 1..7) so allocations never collide.
-//  - Drift guard: structural sync-checks with auto-resync backstop.
-//
-// Limits: 8 players max, no lag compensation, no auth/encryption
-// (LAN/trusted only), dialogs pause the local sim (short-term divergence).
+// shapez CE co-op: one host simulation, acknowledged client edit previews,
+// incremental authoritative state frames. See PROTOCOL.md.
+
+import {
+    STATE_INTERVAL_MS,
+    StateBaseline,
+    StateCapture,
+    applyCommands,
+    applyRuntime,
+    captureSnapshot,
+    reconcileWorld,
+    refreshReplicaCaches,
+    restoreAnalytics,
+    packStateFrame,
+    unpackStateFrame,
+} from "./replication.js";
+import { decodeWireMessage, encodeWireMessage } from "./transport.js";
 
 const ModBase = window.shapez.Mod;
 
 const COOP_TICKRATE = 60;
-const COOP_VERSION = 2;
+const COOP_VERSION = 4;
 const COOP_DEFAULT_PORT = 47821;
-const HUB_STATE_INTERVAL_MS = 5000;
-const DELIVERY_FLUSH_MS = 2000;
 const SYNC_CHECK_MS = 15000;
 const PING_MS = 10000;
 const PEER_EXPIRE_MS = 30000;
@@ -35,15 +31,9 @@ const SLOT_STEP = 8;
 const MAX_CLIENT_SLOTS = 7;
 // Inbound sanity caps (malicious/buggy peers, giant area deletes).
 const MAX_OPS_PER_MESSAGE = 5000;
-const MAX_BATCH_KEYS = 256;
-const MAX_REPLAY_PER_FRAME = 2000;
 // Remote cursor broadcast: 10 Hz while in a session, peers expire them fast.
 const CURSOR_MS = 100;
 const CURSOR_EXPIRE_MS = 2500;
-// Host spreads each delivery batch over ~2s of frames so analytics slices
-// (and throughput goals) see smooth rates instead of one spike.
-const DELIVERY_SPREAD_FRAMES = 120;
-const DELIVERY_QUEUE_CAP = 50000;
 // Persisted player identity (shared by Host + Join so the name only has to
 // be typed once). localStorage survives reloads and new savegames.
 const COOP_NAME_KEY = "shapez-coop:playerName";
@@ -193,8 +183,15 @@ function computeSyncSummary(root) {
         try {
             const staticComp = entity.components.StaticMapEntity;
             entityParts.push(
-                uid + ":" + staticComp.code + ":" + staticComp.rotation + ":" +
-                staticComp.origin.x + "," + staticComp.origin.y
+                uid +
+                    ":" +
+                    staticComp.code +
+                    ":" +
+                    staticComp.rotation +
+                    ":" +
+                    staticComp.origin.x +
+                    "," +
+                    staticComp.origin.y
             );
         } catch {
             entityParts.push(uid + ":?");
@@ -267,6 +264,7 @@ function rootReadyForNet(root) {
 // Message types that mutate or read live game state; anything else
 // (hello/bye/chat/ping/cursor) is safe without a game.
 const ROOTED_MESSAGE_TYPES = new Set([
+    "state",
     "welcome",
     "ops",
     "hub-upgrade",
@@ -314,7 +312,7 @@ function parseJoinInput(input) {
     if (!input) {
         return null;
     }
-    let text = String(input).trim();
+    const text = String(input).trim();
     if (!text) {
         return null;
     }
@@ -379,6 +377,8 @@ class CoopNet {
         this.url = url;
         log("connecting to", url);
         this.socket = socket;
+        this.sendChain = Promise.resolve();
+        let receiveChain = Promise.resolve();
         socket.onopen = () => {
             if (this.socket !== socket) {
                 return; // Stale event from a previous connection
@@ -397,22 +397,37 @@ class CoopNet {
             }
         };
         socket.onmessage = event => {
-            if (this.socket !== socket) {
-                return;
-            }
-            let message;
-            try {
-                message = JSON.parse(event.data);
-            } catch (ex) {
-                warn("dropping non-JSON message", ex);
-                return;
-            }
-            if (message.from === this.clientId) {
-                return; // Relay echoes our own messages back to us
-            }
-            if (this.onMessage) {
-                this.onMessage(message);
-            }
+            receiveChain = receiveChain
+                .then(async () => {
+                    if (this.socket !== socket) {
+                        return;
+                    }
+                    let message;
+                    try {
+                        const start = performance.now();
+                        message = await decodeWireMessage(event.data);
+                        if (this.socket !== socket) return;
+                        if (message.t === "state") {
+                            message = unpackStateFrame(message);
+                            message.decodeMs = performance.now() - start;
+                            message.wireBytes = event.data.length;
+                        }
+                    } catch (ex) {
+                        warn("dropping invalid message", ex);
+                        if (!this.mod.session?.isHost) this.mod.requestResync();
+                        return;
+                    }
+                    if (message.from === this.clientId) {
+                        return; // Relay echoes our own messages back to us
+                    }
+                    if (this.onMessage) {
+                        this.onMessage(message);
+                    }
+                })
+                .catch(ex => {
+                    warn("message handling failed", ex);
+                    if (this.socket === socket) this.mod.requestResync();
+                });
         };
         socket.onclose = () => {
             if (this.socket !== socket) {
@@ -449,10 +464,34 @@ class CoopNet {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
             return false;
         }
+        if (this.socket.bufferedAmount > 512 * 1024 && message.t === "state") {
+            return false; // Retain the baseline and retry after the transport drains.
+        }
         message.from = this.clientId;
         message.v = COOP_VERSION;
         try {
-            this.socket.send(JSON.stringify(message));
+            const wire = JSON.stringify(message.t === "state" ? packStateFrame(message) : message);
+            if (message.t === "bye") {
+                // leaveGame closes immediately after this call; flush departure
+                // before canceling queued compression from the old connection.
+                this.socket.send(wire);
+                return true;
+            }
+            const socket = this.socket;
+            this.sendChain = (this.sendChain || Promise.resolve())
+                .then(async () => {
+                    const encoded =
+                        message.t === "state" || message.t === "welcome"
+                            ? await encodeWireMessage(wire)
+                            : wire;
+                    if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+                    this.lastWireBytes = encoded.length;
+                    socket.send(encoded);
+                })
+                .catch(ex => {
+                    warn("send failed", ex);
+                    if (this.socket === socket) socket.close();
+                });
             return true;
         } catch (ex) {
             warn("send failed", ex);
@@ -584,9 +623,18 @@ export class CoopHudPart extends shapez("BaseHUDPart") {
                 activeMod.setPanelMode("open");
             }
         });
-        this.trackClicks(this.hostButton, () => activeMod && activeMod.hostGame(this.nameInput && this.nameInput.value));
-        this.trackClicks(this.joinButton, () =>
-            activeMod && activeMod.joinGame(this.addrInput && this.addrInput.value, this.nameInput && this.nameInput.value)
+        this.trackClicks(
+            this.hostButton,
+            () => activeMod && activeMod.hostGame(this.nameInput && this.nameInput.value)
+        );
+        this.trackClicks(
+            this.joinButton,
+            () =>
+                activeMod &&
+                activeMod.joinGame(
+                    this.addrInput && this.addrInput.value,
+                    this.nameInput && this.nameInput.value
+                )
         );
         this.trackClicks(query(".coopLeave"), () => activeMod && activeMod.leaveGame());
         this.trackClicks(query(".coopResync"), () => activeMod && activeMod.resyncAll());
@@ -1039,22 +1087,22 @@ export default class CoopMod extends ModBase {
         this.pendingOps = [];
         this.flushScheduled = false;
         this.opSeq = 0;
+        this.baseline = new StateBaseline();
+        this.acceptedSeq = new Map();
+        this.unacknowledged = [];
+        this.blueprintTransaction = null;
         this.lastOpActivity = 0; // last local/remote structural change (ms)
         this.versionWarned = new Set();
         this.slot = 1; // UID slot (0 = host); assigned by welcome, 1 pre-join
         this.hostId = null; // clientId of the session host, once known
         this.slots = new Map(); // host: peerId -> slot (stable across rejoins)
-        this.nextSlot = 1;
         this.awaitingWelcome = false; // client: hold ops until first snapshot
         this.hookedRoots = new WeakSet();
         this.lastResyncRequest = 0;
-        this.deliveryCounts = new Map();
-        this.deliveryQueue = []; // host-side smoothed replay: { def, remaining, perFrame }
         this.peers = new Map(); // clientId -> { name, lastSeen, rtt, isHost }
         this.mismatches = new Map(); // host: clientId -> consecutive sync-check mismatches
         this.lastResync = new Map(); // host: clientId -> timestamp of last auto resync
         this.hubTimer = null;
-        this.deliveryTimer = null;
         this.syncTimer = null;
         this.pingTimer = null;
         this.sweepTimer = null;
@@ -1075,6 +1123,69 @@ export default class CoopMod extends ModBase {
 
         // --- Fixed tickrate while a session is active ---------------------
         const mod = this;
+        // A client renders host state, never independently produces or delivers
+        // items. Wall-clock pauses/FPS therefore cannot change the shared sim.
+        this.modInterface.replaceMethod(shapez("GameTime"), "performTicks", function (oldFn, args) {
+            if (mod.session && !mod.session.isHost && mod.net.connected && mod.session.root === this.root) {
+                this.logicTimeBudget = 0;
+                return;
+            }
+            return oldFn(...args);
+        });
+        this.modInterface.replaceMethod(shapez("ProductionAnalytics"), "update", function (oldFn, args) {
+            if (mod.session && !mod.session.isHost && mod.net.connected && mod.session.root === this.root) {
+                return;
+            }
+            return oldFn(...args);
+        });
+        // Do not allocate provisional slot-1 UIDs or edit the previous map
+        // while waiting for the host's initial/reconnection snapshot.
+        this.modInterface.replaceMethod(GameLogic, "checkCanPlaceEntity", function (oldFn, args) {
+            if (
+                mod.session &&
+                mod.session.root === this.root &&
+                !mod.session.isHost &&
+                mod.awaitingWelcome &&
+                !mod.applyingRemote
+            ) {
+                return false;
+            }
+            return oldFn(...args);
+        });
+        const Blueprint = shapez("Blueprint");
+        this.modInterface.replaceMethod(Blueprint, "tryPlace", function (oldFn, args) {
+            if (
+                !mod.session ||
+                mod.session.root !== args[0] ||
+                mod.session.isHost ||
+                mod.applyingRemote ||
+                !mod.net.connected
+            ) {
+                return oldFn(...args);
+            }
+            if (mod.awaitingWelcome) {
+                return false;
+            }
+            const root = args[0];
+            const cost = this.getIsEffectivelyFree(root)
+                ? null
+                : {
+                      key: root.gameMode.getBlueprintShapeKey(),
+                      amount: this.getCost(),
+                  };
+            const transaction = [];
+            mod.blueprintTransaction = transaction;
+            let result;
+            try {
+                result = oldFn(...args);
+            } finally {
+                mod.blueprintTransaction = null;
+            }
+            if (result) {
+                mod.queueOp({ k: "blueprint", ops: transaction, cost });
+            }
+            return result;
+        });
         const origGetFixedTickrate = GameMode.prototype.getFixedTickrate;
         GameMode.prototype.getFixedTickrate = function () {
             // "regularMode" is enumGameModeIds.regular; puzzle mode keeps 300.
@@ -1131,7 +1242,7 @@ export default class CoopMod extends ModBase {
                 return result;
             }
             const root = this.root;
-            if (!root || !root.gameInitialized) {
+            if (!root || mod.session.root !== root || !root.gameInitialized) {
                 return result; // game setup (hub, loads): covered by snapshots
             }
             mod.queueOp({ k: "place", uid: entity.uid, entity: entity.serialize() });
@@ -1139,6 +1250,15 @@ export default class CoopMod extends ModBase {
         });
 
         this.modInterface.replaceMethod(GameLogic, "tryDeleteBuilding", function (oldFn, args) {
+            if (
+                mod.session &&
+                mod.session.root === this.root &&
+                !mod.session.isHost &&
+                mod.awaitingWelcome &&
+                !mod.applyingRemote
+            ) {
+                return false;
+            }
             const building = args[0];
             const uid = building ? building.uid : null;
             const result = oldFn(...args);
@@ -1148,7 +1268,13 @@ export default class CoopMod extends ModBase {
                 // pass on the next frame (null.components).
                 mod.dropFromMassSelection(this.root, uid);
             }
-            if (!mod.session || mod.applyingRemote || !result || !building) {
+            if (
+                !mod.session ||
+                mod.session.root !== this.root ||
+                mod.applyingRemote ||
+                !result ||
+                !building
+            ) {
                 return result;
             }
             mod.queueOp({ k: "delete", uid: building.uid });
@@ -1157,16 +1283,20 @@ export default class CoopMod extends ModBase {
 
         // --- Replicate hub upgrade purchases --------------------------------
         this.modInterface.replaceMethod(HubGoals, "tryUnlockUpgrade", function (oldFn, args) {
+            if (
+                mod.session &&
+                mod.session.root === this.root &&
+                !mod.session.isHost &&
+                mod.awaitingWelcome &&
+                !mod.applyingRemote
+            ) {
+                return false;
+            }
             const result = oldFn(...args);
-            if (!mod.session || mod.applyingRemote || !result) {
+            if (!mod.session || mod.session.root !== this.root || mod.applyingRemote || !result) {
                 return result;
             }
-            const root = mod.session.root;
-            mod.net.send({
-                t: "hub-upgrade",
-                upgradeId: args[0],
-                level: root.hubGoals.getUpgradeLevel(args[0]),
-            });
+            mod.queueOp({ k: "upgrade", upgradeId: args[0] });
             return result;
         });
 
@@ -1253,7 +1383,8 @@ export default class CoopMod extends ModBase {
         // refill the remembered name + join address.
         try {
             if (part.nameInput && !part.nameInput.value) {
-                part.nameInput.value = loadStoredCoopName() || (this.net.name !== "Player" ? this.net.name : "");
+                part.nameInput.value =
+                    loadStoredCoopName() || (this.net.name !== "Player" ? this.net.name : "");
             }
             if (part.addrInput && !part.addrInput.value) {
                 part.addrInput.value = loadStoredCoopValue(COOP_ADDR_KEY) || "";
@@ -1284,8 +1415,6 @@ export default class CoopMod extends ModBase {
             // instead of leaking cross-map ops for ~30s.
             this.pendingOps = [];
             this.flushScheduled = false;
-            this.deliveryCounts.clear();
-            this.deliveryQueue = [];
             this.mismatches.clear();
             if (this.session.isHost) {
                 this.resyncAll();
@@ -1306,7 +1435,21 @@ export default class CoopMod extends ModBase {
         }
         this.hookedRoots.add(root);
         root.signals.bulkOperationFinished.add(() => this.flushOps());
-        root.signals.gameFrameStarted.add(() => this.drainDeliveries());
+        root.signals.entityChanged.add(entity => {
+            if (!this.session || this.session.root !== root || this.applyingRemote || this.awaitingWelcome) {
+                return;
+            }
+            for (const component of ["Lever", "ConstantSignal"]) {
+                if (entity.components[component]) {
+                    this.queueOp({
+                        k: "configure",
+                        uid: entity.uid,
+                        component,
+                        data: entity.components[component].serialize(),
+                    });
+                }
+            }
+        });
         root.signals.aboutToDestruct.add(() => {
             // Leaving/destroying the game ends the session: no live game
             // means no hub-state, no resync answers, nothing to converge to.
@@ -1318,21 +1461,17 @@ export default class CoopMod extends ModBase {
                 }
                 const wasHost = this.session.isHost;
                 this.endSession();
+                this.net.disconnect();
+                if (wasHost) {
+                    try {
+                        ipcRenderer.invoke("coop-stop").catch(ex => warn("relay shutdown failed", ex));
+                    } catch (ex) {
+                        warn("relay shutdown unavailable", ex);
+                    }
+                }
                 this.setStatus(wasHost ? "game closed (host left)" : "game closed", "warn");
                 this.renderPeers();
             }
-        });
-        root.signals.storyGoalCompleted.add(() => {
-            if (this.session && this.session.isHost) {
-                this.broadcastHubState();
-            }
-        });
-        root.signals.shapeDelivered.add(definition => {
-            if (!this.session || this.session.isHost || this.applyingRemote) {
-                return;
-            }
-            const key = definition.getHash();
-            this.deliveryCounts.set(key, (this.deliveryCounts.get(key) || 0) + 1);
         });
     }
 
@@ -1374,7 +1513,12 @@ export default class CoopMod extends ModBase {
         const invites = buildInvites(status.addresses, status.port);
         this.lastInvites = invites;
         const ownVersion = (this.metadata && this.metadata.version) || "?";
-        log("hosting co-op v" + ownVersion + " on port", status.port, "invites:", invites.map(i => i.url).join(","));
+        log(
+            "hosting co-op v" + ownVersion + " on port",
+            status.port,
+            "invites:",
+            invites.map(i => i.url).join(",")
+        );
         const part = this.hud;
         if (part) {
             if (invites.length > 0) {
@@ -1451,11 +1595,27 @@ export default class CoopMod extends ModBase {
 
     beginSession(root, isHost) {
         this.endTimers();
+        this.stateCapture?.dispose();
+        this.stateCapture = isHost ? new StateCapture(root) : null;
+        this.predictionOps = [];
+        this.stateReceipts = new Map();
+        this.perfStats = null;
+        this.lastFlowLog = Date.now();
+        try {
+            ipcRenderer.invoke("coop-active", true).catch(() => {});
+        } catch {
+            /* Headless tests */
+        }
         this.session = { root, isHost };
         this.pendingOps = [];
         this.flushScheduled = false;
-        this.deliveryCounts.clear();
-        this.deliveryQueue = [];
+        this.opSeq = 0;
+        this.baseline = new StateBaseline();
+        this.acceptedSeq.clear();
+        this.unacknowledged = [];
+        this.lastResyncRequest = 0;
+        this.lastStateAt = Date.now();
+        this.lastSyncCheckAt = 0;
         this.lastCursorSent = null;
         this.peers.clear();
         this.mismatches.clear();
@@ -1465,7 +1625,6 @@ export default class CoopMod extends ModBase {
         if (isHost) {
             this.hostId = this.net.clientId;
             this.slots.clear();
-            this.nextSlot = 1;
         } else {
             this.hostId = null;
             this.slot = 1;
@@ -1500,11 +1659,21 @@ export default class CoopMod extends ModBase {
     endSession() {
         const root = this.session && this.session.root;
         this.endTimers();
+        this.stateCapture?.dispose();
+        this.stateCapture = null;
+        try {
+            ipcRenderer.invoke("coop-active", false).catch(() => {});
+        } catch {
+            /* Headless tests */
+        }
         this.session = null;
         this.pendingOps = [];
         this.flushScheduled = false;
-        this.deliveryCounts.clear();
-        this.deliveryQueue = [];
+        this.unacknowledged = [];
+        this.predictionOps = [];
+        this.stateReceipts?.clear();
+        this.baseline = new StateBaseline();
+        this.acceptedSeq.clear();
         this.lastCursorSent = null;
         this.peers.clear();
         this.mismatches.clear();
@@ -1522,13 +1691,22 @@ export default class CoopMod extends ModBase {
 
     startHostTimers() {
         this.endRoleTimers();
-        this.hubTimer = setInterval(() => this.broadcastHubState(), HUB_STATE_INTERVAL_MS);
+        this.hubTimer = setInterval(() => this.broadcastState(), STATE_INTERVAL_MS);
     }
 
     startClientTimers() {
         this.endRoleTimers();
-        this.deliveryTimer = setInterval(() => this.flushDeliveries(), DELIVERY_FLUSH_MS);
-        this.syncTimer = setInterval(() => this.sendSyncCheck(), SYNC_CHECK_MS);
+        this.syncTimer = setInterval(() => {
+            if (!this.net.connected) {
+                return;
+            }
+            if (Date.now() - this.lastStateAt > 5000) {
+                this.requestResync();
+            } else if (Date.now() - this.lastSyncCheckAt >= SYNC_CHECK_MS) {
+                this.lastSyncCheckAt = Date.now();
+                this.sendSyncCheck();
+            }
+        }, 1000);
     }
 
     startCommonTimers() {
@@ -1546,10 +1724,6 @@ export default class CoopMod extends ModBase {
         if (this.hubTimer) {
             clearInterval(this.hubTimer);
             this.hubTimer = null;
-        }
-        if (this.deliveryTimer) {
-            clearInterval(this.deliveryTimer);
-            this.deliveryTimer = null;
         }
         if (this.syncTimer) {
             clearInterval(this.syncTimer);
@@ -1607,13 +1781,16 @@ export default class CoopMod extends ModBase {
             return;
         }
         const existing = this.peers.get(id);
+        let changed = !existing;
         if (existing) {
             existing.lastSeen = Date.now();
-            if (name) {
+            if (name && name !== existing.name) {
                 existing.name = name;
+                changed = true;
             }
-            if (isHost !== undefined) {
+            if (isHost !== undefined && isHost !== existing.isHost) {
                 existing.isHost = isHost;
+                changed = true;
             }
         } else {
             this.peers.set(id, {
@@ -1623,7 +1800,7 @@ export default class CoopMod extends ModBase {
                 isHost: !!isHost,
             });
         }
-        this.renderPeers();
+        if (changed) this.renderPeers();
     }
 
     sweepPeers() {
@@ -1637,6 +1814,9 @@ export default class CoopMod extends ModBase {
                 this.peers.delete(id);
                 this.mismatches.delete(id);
                 this.lastResync.delete(id);
+                this.slots.delete(id);
+                this.acceptedSeq.delete(id);
+                this.stateReceipts.delete(id);
                 changed = true;
             }
         }
@@ -1659,6 +1839,11 @@ export default class CoopMod extends ModBase {
         // Fresh connection, fresh election: a restarted host has a new id.
         this.hostId = this.session.isHost ? this.net.clientId : null;
         if (!this.session.isHost) {
+            this.awaitingWelcome = true;
+            this.pendingOps = [];
+            this.unacknowledged = [];
+            this.opSeq = 0;
+            this.lastStateAt = Date.now();
             // Drop ghosts from the dead connection; hellos rebuild the list.
             for (const id of this.peers.keys()) {
                 if (id !== this.net.clientId) {
@@ -1666,7 +1851,6 @@ export default class CoopMod extends ModBase {
                 }
             }
             this.renderPeers();
-            this.flushOps();
             this.setStatus("syncing…", "warn");
         } else if (this.session.isHost) {
             this.setStatus("hosting (waiting for join)", "ok");
@@ -1677,6 +1861,9 @@ export default class CoopMod extends ModBase {
         if (!this.session) {
             return;
         }
+        this.pendingOps = [];
+        this.unacknowledged = [];
+        this.awaitingWelcome = false;
         // Age everyone out fast (sweep collects them within ~10s) instead
         // of showing a dead session as healthy for 30s.
         const now = Date.now();
@@ -1713,7 +1900,14 @@ export default class CoopMod extends ModBase {
     }
 
     sendSyncCheck() {
-        if (!this.session || this.session.isHost || !rootReadyForNet(this.session.root)) {
+        if (
+            !this.session ||
+            this.session.isHost ||
+            this.awaitingWelcome ||
+            this.pendingOps.length ||
+            this.unacknowledged.length ||
+            !rootReadyForNet(this.session.root)
+        ) {
             return;
         }
         try {
@@ -1887,57 +2081,21 @@ export default class CoopMod extends ModBase {
         return count;
     }
 
-    /** Recompute every belt direction against the complete map.
-     *  Op batches and snapshots apply entities one by one; intermediate
-     *  neighbor recomputes can strand a belt with a direction decided from
-     *  a partial neighborhood. A final pass over all belts converges both
-     *  peers to the same pure function of the same map. Runs after
-     *  snapshots only (steady-state batches self-converge on arrival). */
-    reconvergeBelts(root) {
-        let system = null;
-        try {
-            system = root.systemMgr.systems.belt;
-        } catch {
-            return 0;
-        }
-        if (!system) {
-            return 0;
-        }
-        const belts = [];
-        try {
-            for (const entity of root.entityMgr.entities.values()) {
-                if (entity.components && entity.components.Belt) {
-                    belts.push(entity);
-                }
-            }
-        } catch {
-            return 0;
-        }
-        // Direct mutation only (no placement hooks fire), so no
-        // applyingRemote guard is needed here.
-        for (const belt of belts) {
-            try {
-                system.updateSurroundingBeltPlacement(belt);
-            } catch (ex) {
-                warn("belt reconverge failed", ex);
-            }
-        }
-        return belts.length;
-    }
-
     /** Client: ask the host for a full snapshot. */
     requestResync() {
         if (!this.session || this.session.isHost) {
             return;
         }
         const now = Date.now();
-        if (now - this.lastResyncRequest < RESYNC_COOLDOWN_MS) {
+        if (now - this.lastResyncRequest < 1000) {
             this.setSync("resync on cooldown…");
             return;
         }
         this.lastResyncRequest = now;
+        if (!this.net.send({ t: "resync-request" })) {
+            return;
+        }
         this.awaitingWelcome = true;
-        this.net.send({ t: "resync-request" });
         this.setSync("resync requested…");
     }
 
@@ -1962,6 +2120,13 @@ export default class CoopMod extends ModBase {
     // --- Op replication ------------------------------------------------------
 
     queueOp(op) {
+        if (!this.session || this.session.isHost || !this.net.connected || this.awaitingWelcome) {
+            return;
+        }
+        if (this.blueprintTransaction) {
+            this.blueprintTransaction.push(op);
+            return;
+        }
         this.pendingOps.push(op);
         this.lastOpActivity = Date.now();
         if (this.flushScheduled) {
@@ -1982,47 +2147,209 @@ export default class CoopMod extends ModBase {
         this.pendingOps = [];
         // Offline ops are already applied locally; never replay them into a
         // session that starts later.
-        if (!this.session || ops.length === 0) {
+        if (!this.session || this.session.isHost || ops.length === 0) {
             return;
         }
-        if (!this.net.send({ t: "ops", seq: this.opSeq++, ops })) {
-            // Socket down: requeue at the front, order preserved
-            this.pendingOps = ops.concat(this.pendingOps);
-        }
-    }
-
-    flushDeliveries() {
-        if (!this.session || this.session.isHost || this.deliveryCounts.size === 0) {
-            return;
-        }
-        if (this.deliveryCounts.size > MAX_BATCH_KEYS) {
-            warn("deliver-batch too large, truncating");
-        }
-        const batch = {};
-        let keys = 0;
-        for (const [key, count] of this.deliveryCounts) {
-            if (keys++ >= MAX_BATCH_KEYS) {
-                break;
+        // Split instead of silently truncating large area-delete batches.
+        for (let start = 0; start < ops.length; start += MAX_OPS_PER_MESSAGE) {
+            const batch = {
+                t: "ops",
+                seq: this.opSeq + 1,
+                ops: ops.slice(start, start + MAX_OPS_PER_MESSAGE),
+            };
+            if (!this.net.send(batch)) {
+                this.pendingOps = ops.slice(start).concat(this.pendingOps);
+                return;
             }
-            batch[key] = count;
-        }
-        if (!this.net.send({ t: "deliver-batch", batch })) {
-            return; // Socket down: keep counts, retry on the next beat
-        }
-        for (const key of Object.keys(batch)) {
-            this.deliveryCounts.delete(key);
+            this.opSeq = batch.seq;
+            this.unacknowledged.push(batch);
         }
     }
 
-    broadcastHubState() {
-        if (!this.session || !this.session.isHost || !rootReadyForNet(this.session.root)) {
+    recordStatePerf(role, sample) {
+        const now = performance.now();
+        const stats =
+            this.perfStats ||
+            (this.perfStats = {
+                start: now,
+                count: 0,
+                workMs: 0,
+                captureMs: 0,
+                decodeMs: 0,
+                bytes: 0,
+                maxMs: 0,
+                rate: 0,
+            });
+        ++stats.count;
+        for (const key of ["workMs", "captureMs", "decodeMs", "bytes"]) stats[key] += sample[key] || 0;
+        stats.maxMs = Math.max(stats.maxMs, (sample.workMs || 0) + (sample.decodeMs || 0));
+        const seconds = (now - stats.start) / 1000;
+        if (seconds >= 5) {
+            stats.rate = stats.count / seconds;
+            log(
+                "state performance",
+                JSON.stringify({
+                    role,
+                    revision: this.baseline.revision,
+                    hz: +stats.rate.toFixed(2),
+                    workMs: +(stats.workMs / stats.count).toFixed(2),
+                    captureMs: +(stats.captureMs / stats.count).toFixed(2),
+                    decodeMs: +(stats.decodeMs / stats.count).toFixed(2),
+                    maxMs: +stats.maxMs.toFixed(2),
+                    bytesPerFrame: Math.round(stats.bytes / stats.count),
+                    kbPerSecond: Math.round(stats.bytes / seconds / 1024),
+                    bufferedBytes: this.net.socket?.bufferedAmount || 0,
+                    hidden: document.hidden || false,
+                    entities: this.session.root.entityMgr.entities.size,
+                })
+            );
+            this.perfStats = {
+                start: now,
+                count: 0,
+                workMs: 0,
+                captureMs: 0,
+                decodeMs: 0,
+                bytes: 0,
+                maxMs: 0,
+                rate: stats.rate,
+            };
+        }
+        return stats.rate;
+    }
+
+    broadcastState(fullSnapshot = false) {
+        if (
+            !this.session ||
+            !this.session.isHost ||
+            !this.net.connected ||
+            !this.slots.size ||
+            !rootReadyForNet(this.session.root)
+        ) {
+            return;
+        }
+        if (
+            !fullSnapshot &&
+            (this.net.socket?.bufferedAmount > 512 * 1024 ||
+                [...this.stateReceipts].some(
+                    ([id, receipt]) => this.slots.has(id) && this.baseline.revision - receipt >= 2
+                ))
+        ) {
+            if (Date.now() - this.lastFlowLog > 5000) {
+                this.lastFlowLog = Date.now();
+                log(
+                    "state backpressure",
+                    JSON.stringify({
+                        revision: this.baseline.revision,
+                        receipts: Object.fromEntries(this.stateReceipts),
+                        bufferedBytes: this.net.socket?.bufferedAmount || 0,
+                    })
+                );
+            }
             return;
         }
         try {
-            this.net.send({ t: "hub-state", hub: this.session.root.hubGoals.serialize() });
+            const started = performance.now();
+            if (!this.stateCapture || this.stateCapture.root !== this.session.root) {
+                this.stateCapture?.dispose();
+                this.stateCapture = new StateCapture(this.session.root);
+            }
+            const snapshot = this.stateCapture.capture();
+            const captured = performance.now();
+            const frame = this.baseline.createFrame(snapshot, Object.fromEntries(this.acceptedSeq));
+            if (this.net.send(frame)) {
+                this.baseline.reset(frame.revision, snapshot.entities, snapshot.beltPaths);
+                this.recordStatePerf("host", {
+                    captureMs: captured - started,
+                    workMs: performance.now() - started,
+                    bytes: this.net.lastWireBytes || 0,
+                });
+                return fullSnapshot ? captureSnapshot(this.session.root, window.shapez, snapshot) : snapshot;
+            }
         } catch (ex) {
-            warn("hub-state serialize failed", ex);
+            warn("state capture failed", ex);
         }
+    }
+
+    applyState(frame) {
+        if (this.awaitingWelcome || frame.from !== this.hostId || this.session.isHost) {
+            return;
+        }
+        try {
+            const started = performance.now();
+            if (!this.baseline.applyFrame(frame)) {
+                return;
+            }
+            this.lastStateAt = Date.now();
+            const previousPredictions = this.unacknowledged
+                .flatMap(batch => batch.ops)
+                .concat(this.pendingOps, this.predictionOps || []);
+            const ack = frame.acknowledgements?.[this.net.clientId] || 0;
+            this.unacknowledged = this.unacknowledged.filter(batch => batch.seq > ack);
+            this.applyingRemote = true;
+            const predictions = this.unacknowledged.flatMap(batch => batch.ops).concat(this.pendingOps);
+            const predictedUids = new Set();
+            const collect = ops => {
+                for (const op of ops) {
+                    if (op.k === "blueprint") collect(op.ops);
+                    else if (op.uid !== undefined) predictedUids.add(op.uid);
+                }
+            };
+            collect(previousPredictions);
+            reconcileWorld(this.session.root, this.baseline, frame, window.shapez, predictedUids);
+            // Replay predictions only until the host has accepted/rejected them.
+            // Every preview is rebased on a complete canonical world, never on
+            // another client's optimistic edit or a stale resync map.
+            if (predictions.length) {
+                applyCommands(this.session.root, predictions, window.shapez);
+            }
+            this.predictionOps = predictions;
+            const rate = this.recordStatePerf("client", {
+                workMs: performance.now() - started,
+                decodeMs: frame.decodeMs || 0,
+                bytes: frame.wireBytes || 0,
+            });
+            this.setSync("host state #" + frame.revision + (rate ? " · " + rate.toFixed(1) + " Hz" : ""));
+            this.net.send({ t: "state-received", to: this.hostId, revision: frame.revision });
+        } catch (ex) {
+            warn("state apply failed", ex);
+            this.lastResyncRequest = 0;
+            this.requestResync();
+        } finally {
+            this.applyingRemote = false;
+        }
+    }
+
+    acceptOps(message) {
+        const slot = this.slots.get(message.from);
+        if (
+            !this.session.isHost ||
+            slot === undefined ||
+            !Array.isArray(message.ops) ||
+            message.ops.length > MAX_OPS_PER_MESSAGE ||
+            !Number.isSafeInteger(message.seq)
+        ) {
+            return;
+        }
+        const previous = this.acceptedSeq.get(message.from) || 0;
+        if (message.seq <= previous) {
+            return;
+        }
+        if (message.seq !== previous + 1) {
+            this.sendWelcome(message.from);
+            return;
+        }
+        this.applyingRemote = true;
+        try {
+            applyCommands(this.session.root, message.ops, window.shapez, slot);
+            this.lastOpActivity = Date.now();
+        } catch (ex) {
+            warn("command rejected", message.from, message.seq, ex);
+        } finally {
+            this.acceptedSeq.set(message.from, message.seq);
+            this.applyingRemote = false;
+        }
+        // The 100 ms publisher coalesces edit bursts. Capturing after every
+        // area-delete packet would block the renderer repeatedly in one frame.
     }
 
     // --- Incoming messages ----------------------------------------------------
@@ -2035,11 +2362,16 @@ export default class CoopMod extends ModBase {
             return; // Relay keep-alive, versionless by design
         }
         if (message.v !== COOP_VERSION) {
+            this.setStatus("protocol mismatch — update both peers", "err");
             warn("dropping message with wrong version", message.v);
             return;
         }
         if (message.from) {
-            this.touchPeer(message.from, message.name, message.t === "hello" && this.session.isHost ? false : undefined);
+            this.touchPeer(
+                message.from,
+                message.name,
+                message.t === "hello" && this.session.isHost ? false : undefined
+            );
         }
         const root = this.session.root;
         if (ROOTED_MESSAGE_TYPES.has(message.t) && !rootReadyForNet(root)) {
@@ -2053,8 +2385,18 @@ export default class CoopMod extends ModBase {
             return;
         }
         switch (message.t) {
-            case "ping":
-                return; // Keep-alive from the relay
+            case "state-received":
+                if (
+                    this.session.isHost &&
+                    message.to === this.net.clientId &&
+                    this.slots.has(message.from) &&
+                    Number.isSafeInteger(message.revision) &&
+                    message.revision <= this.baseline.revision &&
+                    message.revision > (this.stateReceipts.get(message.from) ?? -1)
+                ) {
+                    this.stateReceipts.set(message.from, message.revision);
+                }
+                return;
             case "ping-req":
                 if (message.to === "*" || message.to === this.net.clientId) {
                     this.net.send({ t: "pong", to: message.from, t0: message.t0 });
@@ -2088,10 +2430,27 @@ export default class CoopMod extends ModBase {
                 }
                 return;
             case "bye":
+                if (!this.session.isHost && message.from === this.hostId) {
+                    this.endSession();
+                    this.net.disconnect();
+                    this.setStatus("host left — playing solo copy", "warn");
+                    this.renderPeers();
+                    return;
+                }
                 this.peers.delete(message.from);
                 this.mismatches.delete(message.from);
                 this.lastResync.delete(message.from);
+                this.slots.delete(message.from);
+                this.acceptedSeq.delete(message.from);
+                this.stateReceipts.delete(message.from);
                 this.renderPeers();
+                return;
+            case "session-full":
+                if (message.to === this.net.clientId) {
+                    this.endSession();
+                    this.net.disconnect();
+                    this.setStatus("session full (8 players maximum)", "err");
+                }
                 return;
             case "welcome":
                 if (message.to !== this.net.clientId && message.to !== "*") {
@@ -2107,16 +2466,22 @@ export default class CoopMod extends ModBase {
                     // First valid welcome elects the host; later ones must match
                     this.hostId = message.from;
                     this.touchPeer(message.from, message.name, true);
-                    if (Number.isInteger(message.slot) && message.slot >= 0 && message.slot <= MAX_CLIENT_SLOTS) {
+                    if (
+                        Number.isInteger(message.slot) &&
+                        message.slot >= 1 &&
+                        message.slot <= MAX_CLIENT_SLOTS
+                    ) {
                         this.slot = message.slot;
+                    } else {
+                        return;
                     }
                 }
-                this.applyWelcome(message.dump);
+                this.applyWelcome(message.dump, message.revision, message.ack || 0);
                 return;
             case "resync-request":
                 if (this.session.isHost) {
                     const now = Date.now();
-                    if (now - (this.lastResync.get(message.from) || 0) < RESYNC_COOLDOWN_MS) {
+                    if (now - (this.lastResync.get(message.from) || 0) < 1000) {
                         warn("resync-request throttled for", message.from);
                         return;
                     }
@@ -2130,7 +2495,12 @@ export default class CoopMod extends ModBase {
                 }
                 return;
             case "ops":
-                this.applyOps(root, message.ops || []);
+                if (this.session.isHost) {
+                    this.acceptOps(message);
+                }
+                return;
+            case "state":
+                this.applyState(message);
                 return;
             case "cursor": {
                 const peer = this.peers.get(message.from);
@@ -2146,22 +2516,13 @@ export default class CoopMod extends ModBase {
                 return;
             }
             case "hub-upgrade":
-                this.applyHubUpgrade(root, message);
+                // v3 purchases are ordered, validated commands in ops.
                 return;
             case "hub-state":
-                if (this.session.isHost) {
-                    return;
-                }
-                if (this.hostId !== null && message.from !== this.hostId) {
-                    return; // Only the session host is authoritative
-                }
-                this.touchPeer(message.from, message.name, true);
-                this.applyHubState(root, message);
+                // Included atomically with belt/machine state in v3 frames.
                 return;
             case "deliver-batch":
-                if (this.session.isHost) {
-                    this.applyDeliveryBatch(root, message.batch || {});
-                }
+                // The host already simulates the shared factory exactly once.
                 return;
             case "chat": {
                 const part = this.hud;
@@ -2184,7 +2545,13 @@ export default class CoopMod extends ModBase {
         }
         this.versionWarned.add(message.from);
         const text =
-            "version mismatch: " + (message.name || message.from) + " runs co-op " + theirs + ", you run " + own + " — update both sides";
+            "version mismatch: " +
+            (message.name || message.from) +
+            " runs co-op " +
+            theirs +
+            ", you run " +
+            own +
+            " — update both sides";
         warn(text);
         const part = this.coopPart || this.hud;
         if (part) {
@@ -2225,7 +2592,16 @@ export default class CoopMod extends ModBase {
         this.lastResync.set(message.from, now);
         this.mismatches.set(message.from, 0);
         const driftDiff = summarizeCodeDiff(own.codes, message.codes);
-        log("auto-resyncing diverged peer", message.from, "diff:", driftDiff, "own:", own.codes, "peer:", message.codes);
+        log(
+            "auto-resyncing diverged peer",
+            message.from,
+            "diff:",
+            driftDiff,
+            "own:",
+            own.codes,
+            "peer:",
+            message.codes
+        );
         try {
             window.__coopLastDrift = {
                 at: new Date().toISOString(),
@@ -2240,91 +2616,128 @@ export default class CoopMod extends ModBase {
         this.sendWelcome(message.from);
         const part = this.hud;
         if (part) {
-            part.addChat("system", "resynced diverged peer " + (message.name || message.from) + " (" + driftDiff + ")");
+            part.addChat(
+                "system",
+                "resynced diverged peer " + (message.name || message.from) + " (" + driftDiff + ")"
+            );
         }
         this.setSync("resynced (" + driftDiff + ")");
     }
 
-    sendWelcome(to) {
-        if (!this.session || !rootReadyForNet(this.session.root)) {
-            warn("welcome skipped - no live game");
+    sendWelcome(to, sharedDump = null) {
+        if (!this.session || !this.session.isHost || !rootReadyForNet(this.session.root)) {
             return;
         }
-        // Stable per-peer UID slots (host = 0); rejoins keep their slot.
-        let slot = null;
-        if (to !== "*" && this.session.isHost) {
-            if (!this.slots.has(to)) {
-                let s = this.nextSlot++;
-                if (s > MAX_CLIENT_SLOTS) {
-                    s = ((s - 1) % MAX_CLIENT_SLOTS) + 1;
-                }
-                this.slots.set(to, s);
+        if (to === "*") {
+            const ids = [...this.slots.keys()].filter(id => this.peers.has(id));
+            if (!ids.length) return;
+            const dump = this.broadcastState(true);
+            if (dump) for (const id of ids) this.sendWelcome(id, dump);
+            return;
+        }
+        if (!this.slots.has(to)) {
+            const used = new Set(this.slots.values());
+            const slot = Array.from({ length: MAX_CLIENT_SLOTS }, (_, i) => i + 1).find(s => !used.has(s));
+            if (slot === undefined) {
+                this.net.send({ t: "session-full", to });
+                return; // Never wrap and reuse another peer's UID residue.
             }
-            slot = this.slots.get(to);
+            this.slots.set(to, slot);
         }
         try {
-            const SavegameSerializer = shapez("SavegameSerializer");
-            const dump = new SavegameSerializer().generateDumpFromGameRoot(this.session.root, false);
-            this.net.send({ t: "welcome", to, slot, dump });
-            log("sent welcome dump to", to);
+            // All replicas and the joining peer get the same baseline revision.
+            const dump = sharedDump || this.broadcastState(true);
+            if (!dump) {
+                return; // Retry after backpressure; never mislabel a snapshot's baseline.
+            }
+            this.net.send({
+                t: "welcome",
+                to,
+                slot: this.slots.get(to),
+                dump,
+                revision: this.baseline.revision,
+                ack: this.acceptedSeq.get(to) || 0,
+            });
+            this.stateReceipts.set(to, this.baseline.revision);
+            log("sent welcome dump to", to, "revision", this.baseline.revision);
         } catch (ex) {
             warn("welcome dump failed", ex);
         }
     }
 
-    applyWelcome(dump) {
+    applyWelcome(dump, revision, ack) {
         const root = this.session && this.session.root;
-        if (!root) {
+        if (!root || !Number.isSafeInteger(revision) || revision < 0) {
             return;
         }
-        // Don't teleport the player on every resync; the snapshot is about
-        // buildings, not where we look.
-        let cameraState = null;
+        const serializer = new (shapez("SavegameSerializer"))();
+        const initialized = root.gameInitialized;
+        const cameraState = root.camera.serialize();
         try {
-            cameraState = root.camera.serialize();
-        } catch {
-            // Root partially ready; proceed without restoring
-        }
-        try {
-            // Snapshot apply must not echo: every deserialized entity flows
-            // through registerEntity, which replicates placements live.
+            // Validate before destroying the currently playable map.
+            const validity = serializer.verifyLogicalErrors(dump);
+            if (!validity.isGood()) {
+                throw new Error("savegame invalid: " + validity.reason);
+            }
             this.applyingRemote = true;
+            root.gameInitialized = false;
             this.clearRoot(root);
-            const SavegameSerializer = shapez("SavegameSerializer");
-            const result = new SavegameSerializer().deserialize(dump, root);
-            if (result && result.isGood && !result.isGood()) {
+            // Resource chunks belong to the previous map seed. Keeping them
+            // makes joining a different save show/mine the old map's resources.
+            root.map.chunksById.clear();
+            root.map.aggregatesById.clear();
+            root.buffers?.clear();
+            const result = serializer.deserialize(dump, root);
+            if (!result.isGood()) {
                 throw new Error("savegame invalid: " + result.reason);
             }
-            if (cameraState) {
-                try {
-                    root.camera.deserialize(cameraState);
-                } catch {
-                    // Cosmetic; ignore
-                }
-            }
+            root.camera.deserialize(cameraState);
+            root.time.logicTimeBudget = 0;
             this.broadcastNothingJustResyncUid(root);
-            this.reconvergeBelts(root);
+            for (const data of dump.entities) {
+                applyRuntime(root.entityMgr.findByUid(data.uid, false), data, root, window.shapez);
+            }
+            restoreAnalytics(root, dump.analytics);
+            root.gameInitialized = initialized;
+            root.signals.postLoadHook.dispatch();
+            // The post-load hook has already rebuilt every ejector cache.
+            refreshReplicaCaches(root, true, false);
+            this.baseline.reset(revision, dump.entities, dump.beltPaths);
+            this.lastStateAt = Date.now();
+            this.unacknowledged = this.unacknowledged.filter(batch => batch.seq > ack);
+            this.opSeq = Math.max(this.opSeq, ack);
+            const predictions = this.unacknowledged.flatMap(batch => batch.ops).concat(this.pendingOps);
+            if (predictions.length) {
+                applyCommands(root, predictions, window.shapez);
+            }
+            this.predictionOps = predictions;
+            this.awaitingWelcome = false;
+            // A resync is also a recovery point for a detected sequence gap.
+            // Reliable WebSockets normally make this redundant; dedup on the
+            // host keeps resending an already-processed request harmless.
+            for (const batch of this.unacknowledged) {
+                this.net.send(batch);
+            }
+            this.welcomeFailures = 0;
             this.setStatus("connected (co-op)", "ok");
-            this.setSync("in sync");
-            log("applied welcome dump");
+            this.setSync("host state #" + revision);
+            this.net.send({ t: "state-received", to: this.hostId, revision });
+            log("applied welcome dump", revision);
         } catch (ex) {
             warn("applyWelcome failed, requesting a fresh snapshot", ex);
             this.welcomeFailures = (this.welcomeFailures || 0) + 1;
-            if (this.welcomeFailures > 3) {
-                this.setStatus("sync failed, use Req sync", "err");
-                return;
-            }
             this.setStatus("sync failed, retrying…", "err");
-            this.lastResyncRequest = 0; // allow this one immediate retry
-            this.requestResync();
-            return;
+            // A rejected request must not strand awaitingWelcome forever.
+            this.awaitingWelcome = true;
+            if (this.welcomeFailures <= 3) {
+                setTimeout(() => this.requestResync(), 1100);
+            } else {
+                this.setStatus("sync failed, use Req sync", "err");
+            }
         } finally {
+            root.gameInitialized = initialized;
             this.applyingRemote = false;
         }
-        this.welcomeFailures = 0;
-        // Ops made while "syncing…" are causally newer than the snapshot
-        // (duplicates are skipped by UID); replay them instead of dropping.
-        this.awaitingWelcome = false;
         this.flushOps();
     }
 
@@ -2369,150 +2782,6 @@ export default class CoopMod extends ModBase {
         const mgr = root.entityMgr;
         if (mgr.nextUid <= maxUid) {
             mgr.nextUid = maxUid + 1;
-        }
-    }
-
-    applyOps(root, ops) {
-        if (!Array.isArray(ops) || ops.length === 0) {
-            return;
-        }
-        if (ops.length > MAX_OPS_PER_MESSAGE) {
-            warn("ops batch too large, truncating", ops.length);
-            ops = ops.slice(0, MAX_OPS_PER_MESSAGE);
-        }
-        this.lastOpActivity = Date.now();
-        const SerializerInternal = shapez("SerializerInternal");
-        const internal = new SerializerInternal();
-        this.applyingRemote = true;
-        try {
-            for (const op of ops) {
-                try {
-                    if (op.k === "place") {
-                        // Raw map check: findByUid hides queued-for-destroy
-                        // entities, which would let a crafted batch resurrect
-                        // a UID over a pending destroy.
-                        if (!op.entity || op.entity.uid !== op.uid || root.entityMgr.entities.has(op.uid)) {
-                            continue;
-                        }
-                        internal.deserializeEntity(root, op.entity);
-                        const mgr = root.entityMgr;
-                        if (mgr.nextUid <= op.uid) {
-                            mgr.nextUid = op.uid + 1;
-                        }
-                    } else if (op.k === "delete") {
-                        const entity = root.entityMgr.findByUid(op.uid, false);
-                        if (entity) {
-                            root.logic.tryDeleteBuilding(entity);
-                        }
-                    }
-                } catch (ex) {
-                    warn("op apply failed", op.k, op.uid, ex);
-                }
-            }
-            root.entityMgr.processDestroyList();
-        } finally {
-            this.applyingRemote = false;
-        }
-    }
-
-    applyHubUpgrade(root, message) {
-        const tiers = root.gameMode.getUpgrades()[message.upgradeId];
-        if (!tiers) {
-            warn("unknown upgrade", message.upgradeId);
-            return;
-        }
-        const target = Math.min(message.level | 0, tiers.length);
-        this.applyingRemote = true;
-        try {
-            let guard = 0;
-            while (root.hubGoals.getUpgradeLevel(message.upgradeId) < target && guard++ < 50) {
-                if (!root.hubGoals.tryUnlockUpgrade(message.upgradeId)) {
-                    break;
-                }
-            }
-            // The purchaser already paid: if funds lagged behind the
-            // broadcast (delivery batches arrive every 2s), force-converge
-            // instead of letting the next hub-state silently revert it.
-            let level = root.hubGoals.getUpgradeLevel(message.upgradeId);
-            while (level < target) {
-                root.hubGoals.upgradeLevels[message.upgradeId] = level + 1;
-                root.hubGoals.upgradeImprovements[message.upgradeId] += tiers[level].improvement;
-                level++;
-            }
-        } finally {
-            this.applyingRemote = false;
-        }
-    }
-
-    applyHubState(root, message) {
-        if (this.session.isHost) {
-            return; // Host is authoritative; ignore echoes
-        }
-        this.applyingRemote = true;
-        try {
-            const error = root.hubGoals.deserialize(message.hub, root);
-            if (error) {
-                warn("hub-state deserialize error", error);
-            }
-        } catch (ex) {
-            warn("hub-state apply failed", ex);
-        } finally {
-            this.applyingRemote = false;
-        }
-    }
-
-    applyDeliveryBatch(root, batch) {
-        // Resolve definitions once, then spread the replay over frames so
-        // analytics slices observe smooth rates: exact counts AND correct
-        // throughput for throughputOnly goals.
-        for (const key of Object.keys(batch)) {
-            let count = batch[key] | 0;
-            if (count <= 0) {
-                continue;
-            }
-            // Cap per-message replay so a huge backlog can't freeze the tick
-            count = Math.min(count, 20000);
-            let definition;
-            try {
-                definition = root.shapeDefinitionMgr.getShapeFromShortKey(key);
-            } catch {
-                warn("unknown shape key in deliver-batch", key);
-                continue;
-            }
-            this.deliveryQueue.push({
-                def: definition,
-                remaining: count,
-                perFrame: Math.max(1, Math.ceil(count / DELIVERY_SPREAD_FRAMES)),
-            });
-        }
-        if (this.deliveryQueue.length > DELIVERY_QUEUE_CAP) {
-            this.deliveryQueue.splice(0, this.deliveryQueue.length - DELIVERY_QUEUE_CAP);
-            warn("delivery queue overflow, dropped oldest entries");
-        }
-    }
-
-    drainDeliveries() {
-        if (!this.session || !this.session.isHost || this.deliveryQueue.length === 0) {
-            return;
-        }
-        const root = this.session.root;
-        this.applyingRemote = true;
-        try {
-            let budget = MAX_REPLAY_PER_FRAME;
-            for (let i = this.deliveryQueue.length - 1; i >= 0 && budget > 0; --i) {
-                const entry = this.deliveryQueue[i];
-                const n = Math.min(entry.perFrame, entry.remaining, budget);
-                for (let k = 0; k < n; ++k) {
-                    root.hubGoals.handleDefinitionDelivered(entry.def);
-                }
-                entry.remaining -= n;
-                budget -= n;
-                if (entry.remaining <= 0) {
-                    this.deliveryQueue.splice(i, 1);
-                }
-            }
-        } finally {
-            this.applyingRemote = false;
         }
     }
 }

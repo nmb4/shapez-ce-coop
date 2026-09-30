@@ -20,6 +20,7 @@ export class HUDLeverToggle extends BaseHUDPart {
             if (leverComp) {
                 if (button === enumMouseButton.left) {
                     leverComp.toggled = !leverComp.toggled;
+                    this.root.signals.entityChanged.dispatch(contents);
                     return STOP_PROPAGATION;
                 } else if (button === enumMouseButton.right) {
                     if (!this.root.hud.parts.buildingPlacer.currentMetaBuilding) {

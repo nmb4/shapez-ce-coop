@@ -26,19 +26,22 @@ export class SavegameSerializer {
      * Serializes the game root into a dump
      * @param {GameRoot} root
      * @param {boolean=} sanityChecks Whether to check for validity
+     * @param {object=} capturedState Detached, already serialized live state
      * @returns {object}
      */
-    generateDumpFromGameRoot(root, sanityChecks = true) {
+    generateDumpFromGameRoot(root, sanityChecks = true, capturedState = null) {
         /** @type {SerializedGame} */
         const data = {
             camera: root.camera.serialize(),
-            time: root.time.serialize(),
+            time: capturedState ? capturedState.time : root.time.serialize(),
             map: root.map.serialize(),
             gameMode: root.gameMode.serialize(),
             entityMgr: root.entityMgr.serialize(),
-            hubGoals: root.hubGoals.serialize(),
-            entities: this.internal.serializeEntityMap(root.entityMgr.entities),
-            beltPaths: root.systemMgr.systems.belt.serializePaths(),
+            hubGoals: capturedState ? capturedState.hubGoals : root.hubGoals.serialize(),
+            entities: capturedState
+                ? capturedState.entities
+                : this.internal.serializeEntityMap(root.entityMgr.entities),
+            beltPaths: capturedState ? capturedState.beltPaths : root.systemMgr.systems.belt.serializePaths(),
             pinnedShapes: root.hud.parts.pinnedShapes ? root.hud.parts.pinnedShapes.serialize() : null,
             waypoints: root.hud.parts.waypoints ? root.hud.parts.waypoints.serialize() : null,
 

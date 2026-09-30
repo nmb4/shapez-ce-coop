@@ -71,7 +71,7 @@ export class BeltSystem extends GameSystem {
      * @returns {Array<object>}
      */
     serializePaths() {
-        let data = [];
+        const data = [];
         for (let i = 0; i < this.beltPaths.length; ++i) {
             data.push(this.beltPaths[i].serialize());
         }
@@ -113,6 +113,39 @@ export class BeltSystem extends GameSystem {
         if (G_IS_DEV && globalConfig.debug.checkBeltPaths) {
             this.debug_verifyBeltPaths();
         }
+    }
+
+    /**
+     * Restores authoritative layouts while retaining unaffected path objects.
+     * Items are restored separately by live replication. UID equality alone is
+     * insufficient: a replacement belt may have the same UID and new geometry.
+     * @param {Array<any>} data
+     * @returns {string|void}
+     */
+    reconcilePathLayouts(data) {
+        if (!Array.isArray(data)) return "Belt paths are not an array";
+        const previous = new Map();
+        for (const path of this.beltPaths) previous.set(path.entityPath[0].uid, path);
+        const next = [];
+        for (const layout of data) {
+            const existing = previous.get(layout.entityPath[0]);
+            if (
+                existing &&
+                existing.entityPath.length === layout.entityPath.length &&
+                existing.entityPath.every(
+                    (entity, i) =>
+                        entity.uid === layout.entityPath[i] &&
+                        this.root.entityMgr.findByUid(entity.uid, false) === entity
+                )
+            ) {
+                next.push(existing);
+            } else {
+                const path = BeltPath.fromSerialized(this.root, { ...layout, items: [] });
+                if (!(path instanceof BeltPath)) return "Failed to create path from belt data: " + path;
+                next.push(path);
+            }
+        }
+        this.beltPaths = next;
     }
 
     /**

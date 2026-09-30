@@ -1,174 +1,185 @@
-# Co-op wire protocol (v2)
+# Co-op wire protocol (v4)
 
-Transport: WebSocket text frames carrying JSON. The Electron main-process
-relay (`electron/src/coop/`) broadcasts every message to all connected
-clients except the sender, including back to the host's own renderer.
-Clients MUST ignore messages whose `from` equals their own `clientId`
-(the relay echoes them).
+WebSocket text frames carry JSON through the built-in Electron relay.
+The relay broadcasts to other sockets; all authoritative decisions are made
+by the host renderer. Every decoded game message has `{ t, v: 4, from }`. Ignore
+self messages, unknown types, and incompatible versions. The relay's
+versionless `ping` is a keepalive.
 
-All messages share the envelope:
+Only the host simulates the factory. Clients preview edits and render
+replicated state; client deliveries never contribute to shared production.
+Run co-op 0.10.1 with the matching rebuilt game on every peer.
 
-```json
-{ "t": "<type>", "v": 2, "from": "<clientId>", ... }
-```
+Large state/welcome messages may be gzip-compressed using native browser
+streams, then base64-wrapped as `{ t: "compressed", encoding: "gzip", data }`.
+The inner JSON retains version/sender metadata. Encoding and decoding queues
+preserve message order across asynchronous compression. Reject invalid data
+and messages expanding beyond 64 MB. The relay forwards these text envelopes
+without decoding them. Small/control messages remain ordinary JSON; `bye`
+flushes immediately before disconnect cancels queued work.
 
-`v` is the protocol version. Drop messages with unknown `v`. Unknown `t`
-values MUST be ignored (forward compatibility).
+## Join and snapshot
 
-Clients remember the sender of their first valid `welcome` as the session
-host and ignore `welcome`/`hub-state` from anyone else. The relay itself
-is unauthenticated (trusted LAN only).
-
-## Message types
-
-### `hello` (client → all, on connect)
-
-```json
-{ "t": "hello", "from": "<id>", "name": "Player", "mv": "0.8.1" }
-```
-
-The host replies with `welcome`. Anyone may update their peer list UI.
-`mv` is the co-op mod version; mismatches warn loudly since hash logic
-differs between versions. **Run the same version on all sides.**
-
-### `welcome` (host → joining client)
-
-```json
-{ "t": "welcome", "to": "<clientId>", "slot": 2, "dump": { ...SerializedGame... } }
-```
-
-`dump` is exactly what `SavegameSerializer.generateDumpFromGameRoot`
-produces. Clients ignore it unless `to` matches their `clientId` or is
-`"*"` (host-initiated resync of everyone), and unless it comes from the
-session host. Hosts never apply welcomes.
-
-`slot` is the client's UID allocation slot (see below); rejoins keep
-their slot. The receiver keeps its own camera (the snapshot is about
-buildings, not where you look) and replays locally-held pre-snapshot ops
-after applying (duplicates are skipped by UID).
-
-UID allocation uses stride 8: residue 0 = host, 1..7 = client slots
-(8 players max). Receivers bump `nextUid` past seen UIDs (forward-only).
-
-### `sync-check` (client → host, every 15s)
-
-```json
-{ "t": "sync-check", "hash": "1a2b3c4d", "seq": 1234 }
-```
-
-`hash` is an FNV-1a checksum over the structural sim state (map seed,
-entity count, hub level, upgrade levels, plus per-entity identity tuples
-so moves, rotations and same-UID collisions are detected).
-Stored-shape counters are excluded: they legitimately differ between
-delivery batches and hub-state broadcasts and must not count as drift.
-`seq` is the sender's latest `ops` sequence number (diagnostic for now).
-The host compares against its own hash: two consecutive mismatches
-trigger a targeted `welcome`; auto-resyncs are rate-limited to one per
-peer per minute.
-
-### `resync-request` (client → host)
-
-Ask the host for a targeted `welcome` (same per-peer cooldown as
-auto-resyncs). Also available as the host's `welcome` with `to: "*"`
-(resync everyone).
-
-### `bye` (either → all, on leave)
-
-```json
-{ "t": "bye" }
-```
-
-Peer-list removal. Lists also expire after 30s of silence.
-
-### `ping-req` / `pong` (either → all, every 10s)
-
-Round-trip measurement for the peer list. `pong` is only processed when
-`to` matches the local client.
-
-### `cursor` (either → all, ~10Hz while in a session)
-
-```json
-{ "t": "cursor", "x": 12345, "y": -6789 }
-```
-
-Map cursor in world pixels (see `Camera.screenToWorld`), sent only when
-changed since the last broadcast. Ephemeral: receivers expire it after
-~2.5s without an update and never persist it.
-
-### `ops` (either → all)
-
-Ordered building operations, applied in array order:
+A connecting renderer sends `hello` with `name` and `mv` (mod version).
+The host answers with a targeted `welcome`:
 
 ```json
 {
-  "t": "ops",
-  "seq": 41,
-  "ops": [
-    { "k": "place", "uid": 10422, "entity": { "uid": 10422, "components": { ... } } },
-    { "k": "delete", "uid": 10410 }
-  ]
+    "t": "welcome",
+    "to": "client-id",
+    "slot": 2,
+    "revision": 123,
+    "ack": 8,
+    "dump": { "entities": [], "beltPaths": [] }
 }
 ```
 
-- `seq` is a per-sender monotonic counter (diagnostic for now).
-- `place`: `entity` is one entry of the serialized entity map
-  (`entity.serialize()`) with `entity.uid === uid`. If the UID is already
-  present (including queued-for-destroy), skip it. Otherwise deserialize it
-  and bump `entityMgr.nextUid` past it.
-- `delete`: look up by UID, `tryDeleteBuilding` if found.
-- Receivers MUST NOT rebroadcast applied ops.
-- Batches are capped at 5000 entries.
+`dump` contains the savegame fields plus network-only entity `runtime` data
+and production `analytics`. These additions preserve in-flight processing
+inputs, charges, pending ejects, consumption animations and reader history
+that ordinary saves omit. They do not change the on-disk save format.
 
-UID allocation uses stride 8 (see `welcome`): disjoint by construction;
-any residual collision resolves as first-writer-wins and is caught by the
-sync hash.
+The host first broadcasts state revision `revision`, then sends the snapshot
+of that same synchronous state. The client ignores frames until welcome,
+validates the snapshot before destroying its map, restores it with placement
+heuristics suspended, preserves its camera and rebuilds caches. Its canonical
+baseline is set to `revision`; pending predictions newer than `ack` are
+replayed and resent (the host deduplicates them).
 
-### `hub-upgrade` (either → all)
+Welcome serialization reuses that publication's detached entity/runtime and
+belt capture. The savegame header and serialization hooks are retained without
+walking the factory a second time. A host resync to all connected peers shares
+one capture and revision, with each peer receiving its own slot/acknowledgement.
 
-```json
-{ "t": "hub-upgrade", "upgradeId": "belt", "level": 3 }
-```
+UID allocation uses stride 8: residue 0 for the host and 1..7 for clients.
+A welcome must assign a nonzero client slot. Joining clients cannot build
+before assignment. Receivers advance `nextUid` past observed UIDs; the host
+validates each placement's residue. Slots never wrap over active peers.
+`session-full` with `to` rejects a join when no slot is free.
 
-Receiver purchases the upgrade until its local level reaches `level`;
-if funds lag behind the broadcast the receiver force-converges (the
-purchaser already paid) instead of reverting on the next `hub-state`.
+On reconnect, abandon the disconnected copy's pending edits and wait for a
+fresh snapshot and acknowledgement before issuing commands. A restarted
+host may have a different id; the connection resets host discovery.
 
-### `hub-state` (host → all, every 5s + on goal completion)
+## Authoritative frames
 
-```json
-{ "t": "hub-state", "hub": { ...HubGoals.serialize()... } }
-```
-
-Authoritative hub snapshot. Clients overwrite local hub state.
-Host ignores it.
-
-### `deliver-batch` (client → host, every 2s)
-
-```json
-{ "t": "deliver-batch", "batch": { "<shapeShortKey>": 12 } }
-```
-
-The host replays each shape through
-`HubGoals.handleDefinitionDelivered`, spread over ~120 frames so analytics
-slices observe smooth rates. Keys are `ShapeDefinition.getHash()`
-strings, resolvable via `shapeDefinitionMgr.getShapeFromShortKey`.
-Batches are capped at 256 keys with a bounded per-frame replay budget.
-
-### `chat` (either → all)
+The host publishes `state` at up to 10 Hz. Accepted edit bursts are coalesced
+into the next publication instead of triggering repeated full captures.
+Internally, consecutive captures carry changed/removed entities to avoid a
+second full scan. Publication failure, skipped captures or a new capture owner
+force full comparison; these optimizations do not change wire data or revisions.
+The following is the logical decoded form (before compact wire encoding):
 
 ```json
-{ "t": "chat", "name": "Player", "text": "hello" }
+{
+    "t": "state",
+    "base": 123,
+    "revision": 124,
+    "entities": [{ "uid": 10008, "components": {}, "runtime": {} }],
+    "patches": [{ "uid": 10016, "components": {}, "runtime": {} }],
+    "removed": [10001],
+    "beltPaths": [],
+    "hub": {},
+    "time": {},
+    "analytics": {},
+    "acknowledgements": { "client-id": 9 }
+}
 ```
 
-### `ping` (relay → all, every 25s)
+`entities` contains additions or entities whose geometry changed;
+`patches` contains only changed components/runtime groups of existing entities.
+`removed` lists deleted UIDs. Unchanged belt topology is omitted: `beltUpdates`
+contains changed path indices, items and first-item spacing. If topology
+changes, `beltPaths` replaces the complete layout. The canonical baseline
+reconstructs full entities/paths before reconciliation. Hub goals, simulation
+time and analytics describe the complete state at this revision. Runtime
+excludes entity/path/network pointers and other caches.
 
-Versionless relay keep-alive by design; ignored before the version
-check (never logged as a version mismatch).
+On the wire, `p` stores component/runtime tuples, `bp` stores full belt path
+tuples and `bu` stores path-index updates. `itemTable` deduplicates items across
+the frame; consecutive equal belt distances/items become `[distance, itemId,
+count]` runs. These codecs are lossless relative to the captured data, including
+fixed slot geometry and processing queues. `replication.js` defines the tuple
+layouts and expands them before applying a frame.
 
-## Main-process IPC (renderer ↔ Electron host)
+Only frames from the elected host may mutate a client. Ignore duplicates
+and older revisions. Require `base === localRevision` and
+`revision === base + 1`; otherwise request a snapshot. Never apply a delta
+to an unrelated baseline. Transport backpressure skips publication without
+advancing the host baseline, so the next successful frame remains usable.
 
-- `ipcRenderer.invoke("coop-start", port)` → `{ running, port, peers, addresses }`
-  where `addresses` is `[{ name, address }]` (OS interface name + IPv4).
-- `ipcRenderer.invoke("coop-stop")` → status
-- `ipcRenderer.invoke("coop-status")` → status
-- Event `coop-peer-count` → number of relay connections
+After successful state/welcome application, clients send targeted
+`state-received` with `revision`. The host allows at most two outstanding state
+revisions per welcomed client, deferring capture/publication until receipts
+advance. Receipt revisions cannot exceed the host's published revision. Full
+resyncs may bypass this window to recover a stalled baseline.
+
+Apply only changed entities/components against the canonical cache, removing
+obsolete/colliding local previews before adding entities. Prediction rollback
+also restores the entities touched by current/previous unacknowledged edits,
+including a rejection arriving in the first acknowledgement. Unrelated
+entities remain untouched. Keep existing entities when geometry agrees;
+restore components/runtime queues and host belt items, rebuild topology caches
+only when needed, then replay unacknowledged local edits. Runtime containers on
+the client are reused but never alias the canonical cache. Belt paths whose
+UID sequences and live entity identities still match retain their objects;
+refresh nearby targets and ejectors pointing to replaced paths. Dirty affected
+render chunks rather than the whole map. Wire topology rebuilds follow wire,
+pin or tunnel geometry changes; pin values still update existing networks.
+Never recalculate authoritative belt or wire geometry against a partial map.
+Variable item arrays must shrink when restored; fixed building slot arrays
+retain constructor geometry.
+
+## Client commands
+
+Clients send `ops` with a monotonic `seq` starting at 1. Every batch is
+at most 5000 top-level commands; large deletes split into consecutive batches.
+Client-to-client `ops` are ignored. Host edits enter its world directly and
+are included in the next authoritative frame.
+
+Command forms:
+
+-   `{ k: "place", uid, entity }`: a detached serialized entity. The host
+    validates UID identity/slot and game placement rules, removes replaceable
+    occupants first, places tiles, then registers the entity.
+-   `{ k: "delete", uid }`: delete if found and permitted by game logic.
+-   `{ k: "configure", uid, component, data }`: only `Lever` and
+    `ConstantSignal` component settings can be edited this way.
+-   `{ k: "upgrade", upgradeId }`: attempt one purchase using host funds and
+    the normal upgrade rules. No force-unlock or client-supplied target level.
+-   `{ k: "blueprint", ops, cost }`: group place/delete commands under an
+    immutable placement operation. `cost` is null for a free paste or
+    `{ key, amount }` for blueprint shapes. Reject unaffordable transactions
+    before any edits; charge once if at least one placement succeeded.
+
+The host requires the next sequence, ignores already-processed sequences,
+and acknowledges accepted/rejected work in state. A sequence gap sends a
+fresh welcome. Acknowledgements mean processed, not necessarily successful;
+clients discard predictions through the acknowledged sequence. Concurrent
+conflicts resolve in the host's received order. Applied/predicted commands
+must never be rebroadcast through local hooks.
+
+## Recovery and ephemeral messages
+
+-   `resync-request`: request targeted welcome; limited to one per peer per
+    second. Clients retry stalled initial joins or streams after five seconds.
+-   `sync-check`: structural hash fallback every 15 seconds when no edits are
+    pending. Two quiet mismatches (six during building) can request a snapshot,
+    with a one-minute automatic drift cooldown.
+-   `bye`: release peer/slot metadata. A host bye ends the shared session and
+    resumes the client's solo copy.
+-   `cursor`: world-pixel `x/y`, broadcast on movement at approximately 10 Hz.
+-   `chat`: `name/text`, with text capped at 200 characters.
+-   `ping-req` / targeted `pong`: `t0` timestamp for latency display.
+
+The obsolete `deliver-batch`, `hub-upgrade` and `hub-state` types have no
+mutating behavior in v4. Hub state is atomic with simulation frames.
+
+## Main-process IPC
+
+-   `coop-start(port)` returns `{ running, port, peers, addresses }`;
+    addresses contain interface name and IPv4 address.
+-   `coop-stop`, `coop-status`, and the `coop-peer-count` event manage/status
+    the relay. `coop-log` writes diagnostics to the rotated co-op log.
+-   `coop-active(boolean)` disables background timer/render throttling during
+    a multiplayer session and restores it on departure.

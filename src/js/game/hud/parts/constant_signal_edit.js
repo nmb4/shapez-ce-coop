@@ -144,6 +144,7 @@ export class HUDConstantSignalEdit extends BaseHUDPart {
             } else {
                 constantComp.signal = this.parseSignalCode(entity, signalValueInput.getValue());
             }
+            this.root.signals.entityChanged.dispatch(entityRef);
         };
 
         dialog.buttonSignals.ok.add(() => {

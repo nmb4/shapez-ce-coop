@@ -52,10 +52,19 @@ export default [
     },
     ...nodeConfig.map(config => ({
         ...config,
-        files: ["*.{ts,js}", "{gulp,electron}/**/*.{ts,js}"],
+        files: ["*.{ts,js}", "{gulp,electron}/**/*.{ts,js}", "tests/**/*.{js,cjs}"],
     })),
     ...runtimeConfig.map(config => ({
         ...config,
-        files: ["src/**/*.{ts,js,tsx,jsx}"],
+        files: ["src/**/*.{ts,js,tsx,jsx}", "mods/coop/**/*.js"],
     })),
+    {
+        files: ["mods/coop/**/*.js"],
+        languageOptions: { globals: { ipcRenderer: "readonly" } },
+        rules: { "@typescript-eslint/no-this-alias": ["error", { allowedNames: ["mod", "activeMod"] }] },
+    },
+    {
+        files: ["tests/**/*.cjs"],
+        rules: { "@typescript-eslint/no-require-imports": "off" },
+    },
 ];

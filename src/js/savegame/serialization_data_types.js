@@ -61,7 +61,7 @@ export class BaseDataType {
      * @abstract
      */
     serialize(value) {
-        abstract;
+        abstract; // eslint-disable-line @typescript-eslint/no-unused-expressions
         return {};
     }
 
@@ -82,7 +82,7 @@ export class BaseDataType {
      * @abstract
      */
     deserialize(value, targetObject, targetKey, root) {
-        abstract;
+        abstract; // eslint-disable-line @typescript-eslint/no-unused-expressions
     }
 
     /**
@@ -107,7 +107,7 @@ export class BaseDataType {
      * @abstract
      */
     getAsJsonSchemaUncached() {
-        abstract;
+        abstract; // eslint-disable-line @typescript-eslint/no-unused-expressions
     }
 
     /**
@@ -147,7 +147,7 @@ export class BaseDataType {
      * @abstract
      */
     getCacheKey() {
-        abstract;
+        abstract; // eslint-disable-line @typescript-eslint/no-unused-expressions
         return "";
     }
 }
@@ -682,10 +682,10 @@ export class TypeClass extends BaseDataType {
                 schemaObject({
                     $: {
                         type: "string",
-                        // @ts-ignore
+                        // @ts-expect-error Registry entries expose static serialization methods
                         enum: [entry.getId()],
                     },
-                    // @ts-ignore
+                    // @ts-expect-error Registry entries expose static serialization methods
                     data: schemaToJsonSchema(entry.getCachedSchema()),
                 })
             );
@@ -957,6 +957,12 @@ export class TypeArray extends BaseDataType {
                 return errorStatus;
             }
         }
+        // Live restores reuse the existing object. A shorter variable array
+        // must discard old items (including when the new array is empty).
+        // Fixed slot arrays retain constructor-provided geometry and length.
+        if (!this.fixedSize) {
+            destination.length = value.length;
+        }
     }
 
     getAsJsonSchemaUncached() {
@@ -1106,7 +1112,7 @@ export class TypeKeyValueMap extends BaseDataType {
 
     serialize(value) {
         assert(typeof value === "object", "not an object");
-        let result = {};
+        const result = {};
         for (const key in value) {
             const serialized = this.valueType.serialize(value[key]);
             if (!this.includeEmptyValues && typeof serialized === "object") {
@@ -1136,7 +1142,7 @@ export class TypeKeyValueMap extends BaseDataType {
      * @returns {string|void} String error code or null on success
      */
     deserialize(value, targetObject, targetKey, root) {
-        let result = {};
+        const result = {};
         for (const key in value) {
             const errorCode = this.valueType.deserializeWithVerify(value[key], result, key, root);
             if (errorCode) {
@@ -1355,7 +1361,7 @@ export class TypeStructuredObject extends BaseDataType {
 
     serialize(value) {
         assert(typeof value === "object", "not an object");
-        let result = {};
+        const result = {};
         for (const key in this.descriptor) {
             // assert(value.hasOwnProperty(key), "Serialization: Object does not have", key, "property!");
             result[key] = this.descriptor[key].serialize(value[key]);
@@ -1387,7 +1393,7 @@ export class TypeStructuredObject extends BaseDataType {
     }
 
     getAsJsonSchemaUncached() {
-        let properties = {};
+        const properties = {};
         for (const key in this.descriptor) {
             properties[key] = this.descriptor[key].getAsJsonSchema();
         }
@@ -1404,7 +1410,7 @@ export class TypeStructuredObject extends BaseDataType {
             return "structured object is not an object";
         }
         for (const key in this.descriptor) {
-            if (!value.hasOwnProperty(key)) {
+            if (!Object.hasOwn(value, key)) {
                 return "structured object is missing key " + key;
             }
             const subError = this.descriptor[key].verifySerializedValue(value[key]);
@@ -1415,7 +1421,7 @@ export class TypeStructuredObject extends BaseDataType {
     }
 
     getCacheKey() {
-        let props = [];
+        const props = [];
         for (const key in this.descriptor) {
             props.push(key + "=" + this.descriptor[key].getCacheKey());
         }

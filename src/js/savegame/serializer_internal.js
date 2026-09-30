@@ -41,6 +41,16 @@ export class SerializerInternal {
      * @param {Entity} payload
      */
     deserializeEntity(root, payload) {
+        const entity = this.createEntityFromSerialized(root, payload);
+        // Placement signals inspect the map. Register only after its tiles exist,
+        // just like GameLogic.tryPlaceBuilding and Blueprint.tryPlace do.
+        root.map.placeStaticEntity(entity);
+        root.entityMgr.registerEntity(entity, payload.uid);
+        return entity;
+    }
+
+    /** Creates a detached entity, so callers can validate placement first. */
+    createEntityFromSerialized(root, payload) {
         const staticData = payload.components.StaticMapEntity;
         assert(staticData, "entity has no static data");
 
@@ -60,10 +70,11 @@ export class SerializerInternal {
 
         entity.uid = payload.uid;
 
-        this.deserializeComponents(root, entity, payload.components);
-
-        root.entityMgr.registerEntity(entity, payload.uid);
-        root.map.placeStaticEntity(entity);
+        const error = this.deserializeComponents(root, entity, payload.components);
+        if (error) {
+            throw new Error("Invalid entity " + payload.uid + ": " + error);
+        }
+        return entity;
     }
 
     /////// COMPONENTS ////
@@ -79,7 +90,7 @@ export class SerializerInternal {
         for (const componentId in data) {
             if (!entity.components[componentId]) {
                 if (G_IS_DEV && !globalConfig.debug.disableSlowAsserts) {
-                    // @ts-ignore
+                    // @ts-expect-error Legacy diagnostic counter on the window
                     if (++window.componentWarningsShown < 100) {
                         logger.warn("Entity no longer has component:", componentId);
                     }

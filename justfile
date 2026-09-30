@@ -99,7 +99,7 @@ export platform="win32" arch="x64": (package platform arch)
 lint:
     node "{{root}}/electron/node_modules/typescript/bin/tsc" --noEmit -p "{{root}}/electron"; \
     if ($LASTEXITCODE -ne 0) { throw "typecheck failed" }; \
-    node "{{root}}/node_modules/eslint/bin/eslint.js" mods/coop/entry.js electron/src/coop/; \
+    node "{{root}}/node_modules/eslint/bin/eslint.js" mods/coop/ electron/src/coop/ tests/coop/; \
     if ($LASTEXITCODE -ne 0) { throw "eslint failed" }; \
     Write-Host "lint OK"
 
