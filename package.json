@@ -9,6 +9,7 @@
     "type": "module",
     "scripts": {
         "test:coop": "node tests/coop/run.js",
+        "test:coop:electron": "node tests/coop/electron-smoke.cjs",
         "postinstall": "gulp -f gulp/environment.js prepare",
         "gulp": "gulp --cwd gulp",
         "lint": "eslint .",

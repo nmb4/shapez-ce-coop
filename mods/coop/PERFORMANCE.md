@@ -1,5 +1,58 @@
 # Co-op performance investigation
 
+## Live regression and recovery fix in 0.10.3 (2026-10-01)
+
+The 0.10.2 LAN session at 14:41 UTC regressed badly. The host log records
+0.28–0.57 publications/second, 607–905 ms average capture work, repeated welcomes
+at revisions 1, 2, 4, 6, 7, 8 and 9, and socket buffering growing from 6.6 MB to
+12.4 MB. Previous headless timing improvements did not establish live performance.
+
+A production-only API bug was reproduced: ModLoader exposes `window.shapez`
+through **non-enumerable getter properties**. The reconciliation item-cache
+wrapper spread that namespace into an object, dropping `SerializerInternal` and
+the other game exports. Client application then threw
+`exports.SerializerInternal is not a constructor`, requesting another snapshot.
+The namespace wrapper now inherits the game API and defines only its own item
+resolver. All headless integration fixtures now expose the same getters as the
+real ModLoader; before this fix they reproduced that constructor failure.
+
+No remote client log was available for this incident. The host log confirms the
+snapshot/backlog spiral; the namespace bug mechanically reproduces a trigger for
+it. This does not establish that it caused all 600–900 ms host capture work.
+
+Recovery now coalesces pending welcomes until receipt or a 15-second timeout.
+Clients do not repeatedly request/expand states while waiting for recovery.
+Publication checks both socket buffering and the not-yet-compressed send queue;
+duplicate welcome encodes for a recipient are suppressed. Welcome receipts are
+accepted at their own revision, and departure/reconnection clears pending state.
+Bandwidth diagnostics count actually transmitted state bytes rather than the
+last small ping/chat packet, and expose queued bytes, message count, encode time
+and the most recent welcome size.
+
+`npm run test:coop:electron` adds a separate packaged-runtime smoke test. It opens
+two hidden Chromium renderers, loads their actual bundled game exports and co-op
+mod, and connects them through the real WebSocket relay. Normal UI startup/storage
+is intentionally stopped after export initialization; fixture roots use real game
+classes with drawing/assets stubbed. The default factory mines, transports and
+delivers real shapes. Both that fixture and a read-only copy of the failing save
+passed 20 updates with matching item/production state and no recovery request.
+A forced missing baseline plus a burst of 21 requests recovered with exactly one
+replacement welcome, leaving host and client on the same revision.
+
+The saved-factory fixture has 25,204 entities and excludes nine historical
+overlapping registry records in memory only. No input save is written. Host
+publication work in the 20-frame Electron sample ranged from 12.5 to 31.1 ms;
+native compression, socket delivery and client application run outside this
+capture/encoding sample. This is controlled local integration evidence, **not
+live two-PC FPS**, and rendering load is not measured. The former benchmark
+results below remain historical isolated measurements.
+
+Build with `just export` before the first packaged test. For a mod-only fix on an
+already matching game build, `just rebundle` updates the bundled mod and ZIP.
+Then run `npm run test:coop:electron`. To use another save, set
+`COOP_BENCHMARK_SAVE` as shown below. Logs/results go to an isolated temporary
+`shapez-coop-electron-*` directory, never the game's user-data directory.
+
 The 0.10.0 correctness rewrite was too expensive for a large factory. Its
 100 ms timer generated and JSON-cloned a complete savegame, compared entire
 serialized entities, and sent all belt layouts/items. Clients deserialized
@@ -130,6 +183,52 @@ Simulation code and the wire protocol are unchanged; the differences in
 simulation timings are not claimed as a production-loop improvement. The
 benchmark now reports simulation time and separate warm/cold-inclusive means.
 
+## Fifth pass: capture allocation and editing (0.10.2)
+
+The CPU profile still showed capture and garbage collection as substantial
+costs. Runtime capture now compares and encodes in one traversal, copying
+containers only on a change instead of comparing an active queue repeatedly.
+Miner item buffers and underground pending-item pairs reuse detached captures
+until their values change. Client restoration avoids temporary component
+dictionaries and object-key arrays, retaining the existing schema checks.
+
+Three alternating before/after trials used the same frozen 13,320-building,
+1,493-path fixture and 19 warmed publications per trial:
+
+| Warm cost per publication         | Before this pass | After this pass |
+| --------------------------------- | ---------------: | --------------: |
+| Host capture                      |          12.8 ms |         12.2 ms |
+| Host delta/baseline/JSON encoding |           7.4 ms |          6.8 ms |
+| Host total                        |          20.2 ms |         19.0 ms |
+| Client decode/application total   |          12.6 ms |         12.9 ms |
+| Compressed text payload           |        35.626 KB |       35.644 KB |
+
+Host work decreased by approximately 6%. Client end-to-end timings did not
+improve in these trials; no client FPS or throughput gain is claimed. Payloads
+now preserve the core processor `doNotTrack` flag, previously lost in compact
+queue encoding, accounting for the small wire-size increase.
+
+Building registration previously sorted a system's entire entity list after
+every placement. It now appends ordered UIDs directly or uses ordered insertion
+for an older remote UID. Deferred loads/bulk edits keep an explicit dirty flag
+and still sort on completion or the next live insertion. An isolated comparison
+using the saved factory's 1,461 processor entries and 1,000 added entries averaged:
+
+| Registration order | Previous full sort | Ordered insertion |
+| ------------------ | -----------------: | ----------------: |
+| Ascending UIDs     |            31.3 ms |           0.13 ms |
+| Descending UIDs    |            26.7 ms |           0.47 ms |
+
+This comparison measures registration alone, excluding entity construction,
+map work, placement heuristics and rendering. It does not measure complete
+blueprint time or live multiplayer FPS.
+
+The pass also fixes blueprint costs for duplicate/existing UIDs, clears bulk
+and immutable-operation flags after callback failures, and finalizes affected
+caches before another edit. Disconnected sockets skip queued compression before
+starting it; compression already in flight still completes and is discarded.
+Protocol remains v4; both rebuilt peers must use co-op 0.10.2.
+
 The 0.10.1 client figure includes decompressing the actual compressed envelope.
 Native compression is asynchronous and reported separately from host capture/
 encoding. Payloads exclude TCP/WebSocket overhead. At 10 Hz these means imply
@@ -149,17 +248,22 @@ $env:COOP_BENCHMARK_SAVE = 'C:\path\to\savegame.bin'
 npm run test:coop
 ```
 
-Without that variable, `npm run test:coop` runs the 34 regressions, including
+Without that variable, `npm run test:coop` runs the 42 regressions, including
 real production, compact queue/item codecs, compression/order, scoped
 prediction rollback, flow control, reconnects, slot-schema equivalence, cached
 welcome/hook isolation, progression rollback, peer DOM updates and a WebSocket
 relay round trip. Additional tests cover queue reuse/canonical isolation,
 partial cache refresh with replacement acceptors and split paths, and wire
 topology versus pin-value updates. With a save specified, the benchmark adds
-a 35th test and reports costs/counts for an isolated building edit. New tests
+a 43rd test and reports costs/counts for an isolated building edit. New tests
 cover skipped-publication recovery, capture-owner replacement, unchanged queue
 branches, frozen belt-item reuse/shrinkage and miner schema precision. Compressed
 transport also round-trips non-ASCII and control characters.
+The fifth pass adds UID-order/deferred-cache and failure-cleanup regressions,
+map/key/type changes in one-pass capture, underground precision and buffer reuse,
+duplicate-paste costs, processor tracking flags and canceled compression.
+The 0.10.3 tests also cover the getter-based production namespace, bounded
+recovery/retry, pending welcome receipts/timeouts and a blocked compression queue.
 
 For the next live test, collect `just logs 200` on both PCs after at least ten
 seconds of connected play. `state performance` distinguishes capture work,

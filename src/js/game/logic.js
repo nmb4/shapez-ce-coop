@@ -171,13 +171,13 @@ export class GameLogic {
         assert(!this.root.bulkOperationRunning, "Can not run two bulk operations twice");
         this.root.bulkOperationRunning = true;
         const now = performance.now();
-        const returnValue = operation();
-        const duration = performance.now() - now;
-        logger.log("Done in", round2Digits(duration), "ms");
-        assert(this.root.bulkOperationRunning, "Bulk operation = false while bulk operation was running");
-        this.root.bulkOperationRunning = false;
-        this.root.signals.bulkOperationFinished.dispatch();
-        return returnValue;
+        try {
+            return operation();
+        } finally {
+            this.root.bulkOperationRunning = false;
+            this.root.signals.bulkOperationFinished.dispatch();
+            logger.log("Done in", round2Digits(performance.now() - now), "ms");
+        }
     }
 
     /**
@@ -189,16 +189,13 @@ export class GameLogic {
         assert(!this.root.immutableOperationRunning, "Can not run two immutalbe operations twice");
         this.root.immutableOperationRunning = true;
         const now = performance.now();
-        const returnValue = operation();
-        const duration = performance.now() - now;
-        logger.log("Done in", round2Digits(duration), "ms");
-        assert(
-            this.root.immutableOperationRunning,
-            "Immutable operation = false while immutable operation was running"
-        );
-        this.root.immutableOperationRunning = false;
-        this.root.signals.immutableOperationFinished.dispatch();
-        return returnValue;
+        try {
+            return operation();
+        } finally {
+            this.root.immutableOperationRunning = false;
+            this.root.signals.immutableOperationFinished.dispatch();
+            logger.log("Done in", round2Digits(performance.now() - now), "ms");
+        }
     }
 
     /**

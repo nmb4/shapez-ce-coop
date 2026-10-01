@@ -102,6 +102,14 @@ count]` runs. These codecs are lossless relative to the captured data, including
 fixed slot geometry and processing queues. `replication.js` defines the tuple
 layouts and expands them before applying a frame.
 
+Processor output tuples carry `[itemId, requiredSlot, preferredSlot, flags]`.
+Flag bits 1 and 2 retain optional slot-field presence; co-op 0.10.2 uses bit 4
+for `doNotTrack` presence and bit 8 for its boolean value. Absence stays absent,
+and explicit false stays false. Host/client mod versions must match. Runtime
+captures share unchanged immutable branches; client restoration keeps separate
+mutable containers. Existing-UID placement retries do not count as new paid
+blueprint placements.
+
 Only frames from the elected host may mutate a client. Ignore duplicates
 and older revisions. Require `base === localRevision` and
 `revision === base + 1`; otherwise request a snapshot. Never apply a delta
@@ -113,6 +121,11 @@ After successful state/welcome application, clients send targeted
 revisions per welcomed client, deferring capture/publication until receipts
 advance. Receipt revisions cannot exceed the host's published revision. Full
 resyncs may bypass this window to recover a stalled baseline.
+Compression waiting in the send queue also counts toward transport backpressure,
+before those bytes reach the socket. Welcome sends coalesce per recipient until
+their revision is acknowledged or 15 seconds elapse. A welcome still waiting in
+the encoding queue is never duplicated, even after that timeout. Failed enqueue
+attempts do not mark a recipient as welcomed.
 
 Apply only changed entities/components against the canonical cache, removing
 obsolete/colliding local previews before adding entities. Prediction rollback
@@ -162,7 +175,10 @@ must never be rebroadcast through local hooks.
 ## Recovery and ephemeral messages
 
 -   `resync-request`: request targeted welcome; limited to one per peer per
-    second. Clients retry stalled initial joins or streams after five seconds.
+    second at the host. Clients detect a stalled normal stream after five
+    seconds; while awaiting a welcome they wait 15 seconds before retrying.
+    Failed application does not reset this cooldown. States received while
+    awaiting a welcome are ignored before expanding their compact item tables.
 -   `sync-check`: structural hash fallback every 15 seconds when no edits are
     pending. Two quiet mismatches (six during building) can request a snapshot,
     with a one-minute automatic drift cooldown.

@@ -25,6 +25,7 @@ export class GameSystemWithFilter extends GameSystem {
          * @type {Array<Entity>}
          */
         this.allEntities = [];
+        this.entityOrderDirty = false;
 
         this.root.signals.entityAdded.add(this.internalPushEntityIfMatching, this);
         this.root.signals.entityGotNewComponent.add(this.internalReconsiderEntityToAdd, this);
@@ -98,6 +99,7 @@ export class GameSystemWithFilter extends GameSystem {
         }
 
         this.allEntities.sort((a, b) => a.uid - b.uid);
+        this.entityOrderDirty = false;
     }
 
     /**
@@ -112,11 +114,28 @@ export class GameSystemWithFilter extends GameSystem {
      * @param {Entity} entity
      */
     internalRegisterEntity(entity) {
-        this.allEntities.push(entity);
-
-        if (this.root.gameInitialized && !this.root.bulkOperationRunning) {
-            // Sort entities by uid so behaviour is predictable
-            this.allEntities.sort((a, b) => a.uid - b.uid);
+        const entities = this.allEntities;
+        if (!this.root.gameInitialized || this.root.bulkOperationRunning) {
+            entities.push(entity);
+            this.entityOrderDirty = true;
+        } else if (this.entityOrderDirty) {
+            // Loads and bulk edits defer ordering until their completion hook.
+            // Live replication can also append while gameInitialized is false.
+            entities.push(entity);
+            this.refreshCaches();
+        } else if (!entities.length || entities[entities.length - 1].uid <= entity.uid) {
+            entities.push(entity);
+        } else {
+            // Remote UID slots can arrive out of order. Insert in UID order
+            // without sorting the entire factory after every placement.
+            let low = 0;
+            let high = entities.length;
+            while (low < high) {
+                const middle = (low + high) >>> 1;
+                if (entities[middle].uid <= entity.uid) low = middle + 1;
+                else high = middle;
+            }
+            entities.splice(low, 0, entity);
         }
     }
 

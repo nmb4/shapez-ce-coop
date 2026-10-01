@@ -5,6 +5,6 @@
     "name": "Co-op (built-in host)",
     "description": "Host-authoritative cooperative multiplayer: shared factory, acknowledged building edits and live production state over a built-in LAN relay. See README.md.",
     "authors": [{ "name": "shapez CE contributors" }],
-    "version": "0.10.1",
+    "version": "0.10.3",
     "savegameResident": false
 }

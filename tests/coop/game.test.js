@@ -10,6 +10,7 @@ import { GameMode } from "../../src/js/game/game_mode";
 import { BaseMap } from "../../src/js/game/map";
 import { GameLogic } from "../../src/js/game/logic";
 import { GameSystemManager } from "../../src/js/game/game_system_manager";
+import { GameSystemWithFilter } from "../../src/js/game/game_system_with_filter";
 import { GameTime } from "../../src/js/game/game_time";
 import { DynamicTickrate } from "../../src/js/game/dynamic_tickrate";
 import { EntityManager } from "../../src/js/game/entity_manager";
@@ -24,6 +25,7 @@ import { buildBuildingCodeCache } from "../../src/js/game/building_codes";
 import { MetaBeltBuilding } from "../../src/js/game/buildings/belt";
 import { MetaMinerBuilding } from "../../src/js/game/buildings/miner";
 import { MetaCutterBuilding } from "../../src/js/game/buildings/cutter";
+import { MetaUndergroundBeltBuilding } from "../../src/js/game/buildings/underground_belt";
 import { MetaHubBuilding } from "../../src/js/game/buildings/hub";
 import { MetaLeverBuilding } from "../../src/js/game/buildings/lever";
 import { MetaConstantSignalBuilding } from "../../src/js/game/buildings/constant_signal";
@@ -56,9 +58,18 @@ initItemRegistry();
 initMetaBuildingRegistry();
 buildBuildingCodeCache();
 
-const exports = { SavegameSerializer, SerializerInternal, itemResolverSingleton };
-window.shapez = {
-    ...exports,
+// ModLoader exposes non-enumerable getters, not an enumerable export literal.
+// A spread of the live namespace silently drops every game export.
+const exportGetters = values =>
+    Object.defineProperties(
+        {},
+        Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { get: () => value }]))
+    );
+const exports = exportGetters({ SavegameSerializer, SerializerInternal, itemResolverSingleton });
+window.shapez = exportGetters({
+    SavegameSerializer,
+    SerializerInternal,
+    itemResolverSingleton,
     GameMode,
     GameLogic,
     GameTime,
@@ -73,7 +84,7 @@ window.shapez = {
         drawOverlays() {}
     },
     KEYCODES: { F8: 119 },
-};
+});
 
 class TestMode extends GameMode {
     static getId() {
@@ -318,6 +329,42 @@ if (process.env.COOP_BENCHMARK_SAVE) {
             [...chunks].filter(([chunk, iteration]) => chunk.renderIteration !== iteration).length,
             0
         );
+        // Isolate the registration cost from building construction/map work.
+        // Use the loaded factory's processor list and the previous full-sort
+        // implementation as the control, preserving the same ordered result.
+        const processorEntities = host.systemMgr.systems.itemProcessor.allEntities;
+        const legacyRegister = function (entity) {
+            this.allEntities.push(entity);
+            if (this.root.gameInitialized && !this.root.bulkOperationRunning)
+                this.allEntities.sort((a, b) => a.uid - b.uid);
+        };
+        const registration = {};
+        for (const order of ["ascending", "descending"]) {
+            const additions = Array.from({ length: 1000 }, (_, i) => ({
+                uid: host.entityMgr.nextUid + (order === "ascending" ? i : 999 - i),
+            }));
+            let expected;
+            for (const [kind, method] of [
+                ["fullSort", legacyRegister],
+                ["orderedInsert", GameSystemWithFilter.prototype.internalRegisterEntity],
+            ]) {
+                const sample = {
+                    root: host,
+                    allEntities: processorEntities.slice(),
+                    entityOrderDirty: false,
+                };
+                const start = performance.now();
+                for (const entity of additions) method.call(sample, entity);
+                registration[order + "_" + kind + "Ms"] = performance.now() - start;
+                const uids = sample.allEntities.map(entity => entity.uid);
+                if (expected) assert.deepEqual(uids, expected);
+                else expected = uids;
+            }
+        }
+        console.log(
+            "COOP PROFILE registration",
+            JSON.stringify({ existing: processorEntities.length, additions: 1000, ...registration })
+        );
     });
 }
 
@@ -489,6 +536,8 @@ test("blueprint and upgrade costs are paid once on the host and rejected when un
     root.hubGoals.storedShapes[key] = 20;
     applyCommands(root, [op], exports, 1);
     assert.equal(root.hubGoals.storedShapes[key], 10);
+    assert.equal(applyCommands(root, [op], exports, 1), false);
+    assert.equal(root.hubGoals.storedShapes[key], 10, "an existing UID is not a new paid placement");
     root.hubGoals.storedShapes.CuCuCuCu = 30;
     applyCommands(
         root,
@@ -527,6 +576,79 @@ test("client configuration edits carry lever and constant signal state", () => {
     );
     assert.equal(lever.components.Lever.toggled, true);
     assert.equal(constant.components.ConstantSignal.signal.getItemType(), "boolean");
+});
+
+test("failed bulk and blueprint operations clear flags and finalize partially changed caches", () => {
+    for (const [method, flag, signal] of [
+        ["performBulkOperation", "bulkOperationRunning", "bulkOperationFinished"],
+        ["performImmutableOperation", "immutableOperationRunning", "immutableOperationFinished"],
+    ]) {
+        const root = makeRoot();
+        const removed = place(root, MetaCutterBuilding, 10, 10);
+        let completed = 0;
+        root.signals[signal].add(() => {
+            ++completed;
+            assert.equal(root[flag], false);
+        });
+        const failure = new Error("placement callback failed");
+        assert.throws(
+            () =>
+                root.logic[method](() => {
+                    assert.ok(root.logic.tryDeleteBuilding(removed));
+                    place(root, MetaCutterBuilding, 20, 20);
+                    throw failure;
+                }),
+            error => error === failure
+        );
+        assert.equal(root[flag], false);
+        assert.equal(completed, 1);
+        assert.ok(!root.systemMgr.systems.itemProcessor.allEntities.includes(removed));
+        assert.equal(
+            root.logic[method](() => 42),
+            42
+        );
+        assert.equal(completed, 2);
+        tick(root, 1);
+    }
+});
+
+test("filtered systems keep UID ordering for remote slots, deferred appends and bulk completion", () => {
+    const root = makeRoot();
+    const source = makeRoot();
+    const system = root.systemMgr.systems.itemProcessor;
+    let sorts = 0;
+    const sort = system.allEntities.sort;
+    system.allEntities.sort = function (...args) {
+        ++sorts;
+        return sort.apply(this, args);
+    };
+    const add = (uid, x) => {
+        const entity = place(source, MetaCutterBuilding, x, 20).serialize();
+        entity.uid = uid;
+        applyCommands(root, [{ k: "place", uid, entity }], exports, 1);
+    };
+    for (const [i, uid] of [10401, 10001, 10561, 10081].entries()) add(uid, 20 + i * 10);
+    const assertOrder = expected =>
+        assert.deepEqual(
+            system.allEntities.map(entity => entity.uid),
+            expected
+        );
+    assertOrder([10001, 10081, 10401, 10561]);
+    assert.equal(sorts, 0, "live inserts preserve ordering without a full sort");
+    root.gameInitialized = false;
+    add(10041, 80);
+    root.gameInitialized = true;
+    add(10121, 90);
+    assertOrder([10001, 10041, 10081, 10121, 10401, 10561]);
+    assert.equal(sorts, 1, "a deferred append must not leave an unsorted list");
+    root.logic.performBulkOperation(() => {
+        add(10161, 100);
+        root.logic.tryDeleteBuilding(root.entityMgr.findByUid(10081, false));
+        add(10105, 110);
+    });
+    assertOrder([10001, 10041, 10105, 10121, 10161, 10401, 10561]);
+    assert.equal(sorts, 2);
+    tick(root, 1);
 });
 
 test("large deletes split without loss and duplicate command sequences do not charge twice", async t => {
@@ -680,6 +802,11 @@ test("backpressure retains the baseline and defers welcome until its frame is pu
         mod.messages.some(message => message.t === "welcome"),
         false
     );
+    mod.net.send = message => (message.t === "welcome" ? false : send(message));
+    mod.sendWelcome("peer");
+    assert.equal(mod.baseline.revision, 1);
+    assert.equal(mod.pendingWelcomes.has("peer"), false, "a failed send must not suppress recovery");
+    assert.equal(mod.stateReceipts.has("peer"), false, "a failed welcome is not an application receipt");
     mod.net.send = send;
     mod.sendWelcome("peer");
     const welcome = mod.messages.at(-1);
@@ -818,6 +945,75 @@ test("changing a charge timer reuses unchanged captured queue branches without m
         assert.equal(runtime.queuedEjects, previous.queuedEjects);
         assert.equal(JSON.stringify(first), frozen);
         assert.deepEqual(next.entities, captureSnapshot(root, exports).entities);
+    } finally {
+        capture.dispose();
+    }
+});
+
+test("one-pass runtime captures detach map, object-key, type and array changes", () => {
+    const root = makeRoot();
+    const entity = place(root, MetaCutterBuilding, 10, 10);
+    const processor = entity.components.ItemProcessor;
+    const item = root.shapeDefinitionMgr.getShapeItemFromShortKey("CuCuCuCu");
+    processor.inputSlots.set(0, item);
+    processor.ongoingCharges = [{ remainingTime: 0.4, items: [{ item, requiredSlot: 0, extra: 3 }] }];
+    const capture = new StateCapture(root);
+    try {
+        const first = capture.capture();
+        const frozen = JSON.stringify(first);
+        processor.inputSlots.clear();
+        processor.inputSlots.set(1, item);
+        const eject = processor.ongoingCharges[0].items[0];
+        delete eject.requiredSlot;
+        eject.preferredSlot = null;
+        eject.extra = {};
+        const second = capture.capture();
+        assert.deepEqual(second.entities, captureSnapshot(root, exports).entities);
+        assert.equal(
+            Object.hasOwn(
+                second.entities[0].runtime.ItemProcessor.ongoingCharges[0].items[0],
+                "requiredSlot"
+            ),
+            false
+        );
+        eject.extra = [];
+        assert.deepEqual(capture.capture().entities, captureSnapshot(root, exports).entities);
+        processor.ongoingCharges.length = 0;
+        processor.inputSlots.clear();
+        assert.deepEqual(capture.capture().entities, captureSnapshot(root, exports).entities);
+        assert.equal(JSON.stringify(first), frozen);
+    } finally {
+        capture.dispose();
+    }
+});
+
+test("underground and miner captures preserve precision and reuse unchanged item containers", () => {
+    const root = makeRoot();
+    const tunnel = place(root, MetaUndergroundBeltBuilding, 10, 10).components.UndergroundBelt;
+    const miner = place(root, MetaMinerBuilding, 20, 20).components.Miner;
+    const item = root.shapeDefinitionMgr.getShapeItemFromShortKey("CuCuCuCu");
+    const capture = new StateCapture(root);
+    try {
+        capture.capture();
+        tunnel.pendingItems.push([item, 0.00009]);
+        miner.itemChainBuffer.push(item);
+        const initial = capture.capture();
+        const frozen = JSON.stringify(initial);
+        for (const time of [-0.10005, 0.10005, 0.99999, 1.00001]) {
+            tunnel.pendingItems[0][1] = time;
+            miner.lastMiningTime = Math.abs(time);
+            const current = capture.capture();
+            assert.deepEqual(current.entities, captureSnapshot(root, exports).entities);
+            assert.equal(
+                current.entities[1].components.Miner.itemChainBuffer,
+                initial.entities[1].components.Miner.itemChainBuffer
+            );
+            assert.equal(capture.capture().entities[0], current.entities[0]);
+        }
+        tunnel.pendingItems.length = 0;
+        miner.itemChainBuffer.length = 0;
+        assert.deepEqual(capture.capture().entities, captureSnapshot(root, exports).entities);
+        assert.equal(JSON.stringify(initial), frozen);
     } finally {
         capture.dispose();
     }
@@ -1257,6 +1453,124 @@ test("a slow client's receipts bound queued frames without capturing another sav
     assert.equal(captures, 1);
 });
 
+test("failed client application requests one snapshot and waits before retrying", async t => {
+    const root = makeRoot();
+    const mod = await makeMod(root, false, t);
+    const now = Date.now;
+    let clock = now();
+    Date.now = () => clock;
+    try {
+        mod.awaitingWelcome = false;
+        mod.hostId = "host";
+        const broken = { from: "host", base: 10, revision: 11 };
+        mod.applyState(broken);
+        assert.equal(mod.awaitingWelcome, true);
+        for (let i = 0; i < 14; ++i) {
+            clock += 1000;
+            mod.applyState(broken);
+            mod.requestResync();
+        }
+        assert.equal(mod.messages.filter(message => message.t === "resync-request").length, 1);
+        clock += 1001;
+        mod.requestResync();
+        assert.equal(mod.messages.filter(message => message.t === "resync-request").length, 2);
+        mod.applyWelcome(captureSnapshot(root, exports), 12, 0);
+        assert.equal(mod.awaitingWelcome, false);
+        assert.equal(mod.messages.at(-1).t, "state-received");
+    } finally {
+        Date.now = now;
+    }
+});
+
+test("pending welcomes coalesce requests until a valid receipt or snapshot timeout", async t => {
+    const root = makeRoot();
+    const mod = await makeMod(root, true, t);
+    mod.touchPeer("peer", "Peer", false);
+    const now = Date.now;
+    let clock = now();
+    Date.now = () => clock;
+    try {
+        let captures = 0;
+        const capture = mod.stateCapture.capture.bind(mod.stateCapture);
+        mod.stateCapture.capture = () => {
+            ++captures;
+            return capture();
+        };
+        mod.sendWelcome("peer");
+        for (let i = 0; i < 14; ++i) {
+            clock += 1000;
+            mod.sendWelcome("peer");
+            mod.sendWelcome("*");
+        }
+        assert.equal(captures, 1, "duplicate requests must not even capture another factory");
+        const receipt = revision =>
+            mod.handleMessage({ t: "state-received", v: 4, from: "peer", to: mod.net.clientId, revision });
+        receipt(100);
+        assert.equal(mod.pendingWelcomes.size, 1, "future receipts cannot release recovery flow control");
+        receipt(0);
+        assert.equal(mod.pendingWelcomes.size, 1, "stale receipts cannot release recovery flow control");
+        receipt(1);
+        assert.equal(mod.pendingWelcomes.size, 0, "the welcome's own revision must be acknowledged");
+        mod.sendWelcome("peer");
+        assert.equal(captures, 2);
+        clock += 15001;
+        mod.sendWelcome("peer");
+        assert.equal(captures, 3, "a lost or rejected welcome must remain recoverable");
+        mod.handleMessage({ t: "bye", v: 4, from: "peer" });
+        assert.equal(mod.pendingWelcomes.size, 0);
+    } finally {
+        Date.now = now;
+    }
+});
+
+test("compression backlog bounds publication before bytes reach the WebSocket", async t => {
+    const mod = await makeMod(makeRoot(), true, t);
+    mod.slots.set("peer", 1);
+    const wires = [];
+    mod.net.socket = {
+        readyState: WebSocket.OPEN,
+        bufferedAmount: 0,
+        send: wire => wires.push(wire),
+        close() {},
+    };
+    mod.net.send = Object.getPrototypeOf(mod.net).send.bind(mod.net);
+    let release;
+    mod.net.sendChain = new Promise(resolve => (release = resolve));
+    try {
+        const welcome = { t: "welcome", to: "peer", dump: { repeated: "abcdefgh".repeat(100000) } };
+        assert.equal(mod.net.send(welcome), true);
+        assert.equal(mod.net.send(welcome), false, "one peer cannot queue duplicate full snapshots");
+        assert.ok(mod.net.sendStats.queuedBytes > 512 * 1024);
+        assert.equal(mod.net.sendStats.pending, 1);
+        let captures = 0;
+        const capture = mod.stateCapture.capture.bind(mod.stateCapture);
+        mod.stateCapture.capture = () => {
+            ++captures;
+            return capture();
+        };
+        mod.broadcastState();
+        mod.sendWelcome("other");
+        assert.equal(captures, 0);
+        assert.equal(mod.baseline.revision, 0);
+        release();
+        await mod.net.sendChain;
+        assert.equal(wires.length, 1);
+        assert.equal(mod.net.sendStats.queuedBytes, 0);
+        assert.equal(mod.net.sendStats.pending, 0);
+        assert.equal(mod.net.sendStats.welcomes.size, 0);
+        assert.equal(mod.net.sendStats.lastWelcomeBytes, wires[0].length);
+        mod.broadcastState();
+        await mod.net.sendChain;
+        assert.equal(captures, 1);
+        assert.equal(mod.net.sendStats.stateCount, 1);
+        assert.equal(mod.net.sendStats.stateBytes, wires[1].length);
+    } finally {
+        release();
+        mod.net.disconnect();
+        await mod.net.sendChain;
+    }
+});
+
 test("compression preserves send order and departure flushes before disconnect", async t => {
     const mod = await makeMod(makeRoot(), false, t);
     const wires = [];
@@ -1275,6 +1589,36 @@ test("compression preserves send order and departure flushes before disconnect",
     mod.net.send({ t: "bye" });
     mod.net.disconnect();
     assert.equal(JSON.parse(wires[2]).t, "bye");
+});
+
+test("disconnect cancels queued compression before it starts on an obsolete socket", async t => {
+    const mod = await makeMod(makeRoot(), false, t);
+    const wires = [];
+    mod.net.socket = {
+        readyState: WebSocket.OPEN,
+        bufferedAmount: 0,
+        send: wire => wires.push(wire),
+        close() {},
+    };
+    mod.net.send = Object.getPrototypeOf(mod.net).send.bind(mod.net);
+    const NativeCompression = globalThis.CompressionStream;
+    let compressions = 0;
+    globalThis.CompressionStream = class extends NativeCompression {
+        constructor(...args) {
+            super(...args);
+            ++compressions;
+        }
+    };
+    try {
+        mod.net.send({ t: "welcome", dump: { repeated: "abcdefgh".repeat(10000) } });
+        mod.net.send({ t: "welcome", dump: { repeated: "abcdefgh".repeat(10000) } });
+        mod.net.disconnect();
+        await mod.net.sendChain;
+        assert.equal(compressions, 0);
+        assert.equal(wires.length, 0);
+    } finally {
+        globalThis.CompressionStream = NativeCompression;
+    }
 });
 
 test("real WebSocket relay carries welcome, client edits and authoritative acknowledgements", async t => {

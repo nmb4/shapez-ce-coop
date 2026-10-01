@@ -34,6 +34,7 @@ const MAX_OPS_PER_MESSAGE = 5000;
 // Remote cursor broadcast: 10 Hz while in a session, peers expire them fast.
 const CURSOR_MS = 100;
 const CURSOR_EXPIRE_MS = 2500;
+const SNAPSHOT_TIMEOUT_MS = 15000;
 // Persisted player identity (shared by Host + Join so the name only has to
 // be typed once). localStorage survives reloads and new savegames.
 const COOP_NAME_KEY = "shapez-coop:playerName";
@@ -358,6 +359,15 @@ class CoopNet {
         this.onMessage = null;
         this.onOpen = null;
         this.onClose = null;
+        this.resetTransportStats();
+    }
+
+    resetTransportStats() {
+        this.sendStats = { pending: 0, queuedBytes: 0, welcomes: new Set(), stateBytes: 0, stateCount: 0 };
+    }
+
+    transportBusy() {
+        return (this.socket?.bufferedAmount || 0) + this.sendStats.queuedBytes > 512 * 1024;
     }
 
     connect(url) {
@@ -377,6 +387,7 @@ class CoopNet {
         this.url = url;
         log("connecting to", url);
         this.socket = socket;
+        this.resetTransportStats();
         this.sendChain = Promise.resolve();
         let receiveChain = Promise.resolve();
         socket.onopen = () => {
@@ -408,6 +419,7 @@ class CoopNet {
                         message = await decodeWireMessage(event.data);
                         if (this.socket !== socket) return;
                         if (message.t === "state") {
+                            if (this.mod.awaitingWelcome) return;
                             message = unpackStateFrame(message);
                             message.decodeMs = performance.now() - start;
                             message.wireBytes = event.data.length;
@@ -464,9 +476,11 @@ class CoopNet {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
             return false;
         }
-        if (this.socket.bufferedAmount > 512 * 1024 && message.t === "state") {
+        if (this.transportBusy() && message.t === "state") {
             return false; // Retain the baseline and retry after the transport drains.
         }
+        const stats = this.sendStats;
+        if (message.t === "welcome" && stats.welcomes.has(message.to)) return false;
         message.from = this.clientId;
         message.v = COOP_VERSION;
         try {
@@ -478,8 +492,13 @@ class CoopNet {
                 return true;
             }
             const socket = this.socket;
+            ++stats.pending;
+            stats.queuedBytes += wire.length;
+            if (message.t === "welcome") stats.welcomes.add(message.to);
             this.sendChain = (this.sendChain || Promise.resolve())
                 .then(async () => {
+                    if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
+                    const started = performance.now();
                     const encoded =
                         message.t === "state" || message.t === "welcome"
                             ? await encodeWireMessage(wire)
@@ -487,10 +506,20 @@ class CoopNet {
                     if (this.socket !== socket || socket.readyState !== WebSocket.OPEN) return;
                     this.lastWireBytes = encoded.length;
                     socket.send(encoded);
+                    if (message.t === "state") {
+                        stats.stateBytes += encoded.length;
+                        ++stats.stateCount;
+                        stats.lastStateMs = performance.now() - started;
+                    } else if (message.t === "welcome") stats.lastWelcomeBytes = encoded.length;
                 })
                 .catch(ex => {
                     warn("send failed", ex);
                     if (this.socket === socket) socket.close();
+                })
+                .finally(() => {
+                    --stats.pending;
+                    stats.queuedBytes -= wire.length;
+                    if (message.t === "welcome") stats.welcomes.delete(message.to);
                 });
             return true;
         } catch (ex) {
@@ -1599,6 +1628,7 @@ export default class CoopMod extends ModBase {
         this.stateCapture = isHost ? new StateCapture(root) : null;
         this.predictionOps = [];
         this.stateReceipts = new Map();
+        this.pendingWelcomes = new Map();
         this.perfStats = null;
         this.lastFlowLog = Date.now();
         try {
@@ -1672,6 +1702,7 @@ export default class CoopMod extends ModBase {
         this.unacknowledged = [];
         this.predictionOps = [];
         this.stateReceipts?.clear();
+        this.pendingWelcomes?.clear();
         this.baseline = new StateBaseline();
         this.acceptedSeq.clear();
         this.lastCursorSent = null;
@@ -1700,7 +1731,7 @@ export default class CoopMod extends ModBase {
             if (!this.net.connected) {
                 return;
             }
-            if (Date.now() - this.lastStateAt > 5000) {
+            if (Date.now() - this.lastStateAt > (this.awaitingWelcome ? SNAPSHOT_TIMEOUT_MS : 5000)) {
                 this.requestResync();
             } else if (Date.now() - this.lastSyncCheckAt >= SYNC_CHECK_MS) {
                 this.lastSyncCheckAt = Date.now();
@@ -1817,6 +1848,7 @@ export default class CoopMod extends ModBase {
                 this.slots.delete(id);
                 this.acceptedSeq.delete(id);
                 this.stateReceipts.delete(id);
+                this.pendingWelcomes.delete(id);
                 changed = true;
             }
         }
@@ -1838,6 +1870,9 @@ export default class CoopMod extends ModBase {
         }
         // Fresh connection, fresh election: a restarted host has a new id.
         this.hostId = this.session.isHost ? this.net.clientId : null;
+        this.perfStats = null;
+        this.lastResyncRequest = 0;
+        this.pendingWelcomes.clear();
         if (!this.session.isHost) {
             this.awaitingWelcome = true;
             this.pendingOps = [];
@@ -2087,6 +2122,12 @@ export default class CoopMod extends ModBase {
             return;
         }
         const now = Date.now();
+        if (
+            this.awaitingWelcome &&
+            this.lastResyncRequest &&
+            now - this.lastResyncRequest < SNAPSHOT_TIMEOUT_MS
+        )
+            return;
         if (now - this.lastResyncRequest < 1000) {
             this.setSync("resync on cooldown…");
             return;
@@ -2179,6 +2220,8 @@ export default class CoopMod extends ModBase {
                 bytes: 0,
                 maxMs: 0,
                 rate: 0,
+                sentBytes: this.net.sendStats.stateBytes,
+                sentCount: this.net.sendStats.stateCount,
             });
         ++stats.count;
         for (const key of ["workMs", "captureMs", "decodeMs", "bytes"]) stats[key] += sample[key] || 0;
@@ -2186,6 +2229,8 @@ export default class CoopMod extends ModBase {
         const seconds = (now - stats.start) / 1000;
         if (seconds >= 5) {
             stats.rate = stats.count / seconds;
+            const bytes = role === "host" ? this.net.sendStats.stateBytes - stats.sentBytes : stats.bytes;
+            const count = role === "host" ? this.net.sendStats.stateCount - stats.sentCount : stats.count;
             log(
                 "state performance",
                 JSON.stringify({
@@ -2196,9 +2241,13 @@ export default class CoopMod extends ModBase {
                     captureMs: +(stats.captureMs / stats.count).toFixed(2),
                     decodeMs: +(stats.decodeMs / stats.count).toFixed(2),
                     maxMs: +stats.maxMs.toFixed(2),
-                    bytesPerFrame: Math.round(stats.bytes / stats.count),
-                    kbPerSecond: Math.round(stats.bytes / seconds / 1024),
+                    bytesPerFrame: count ? Math.round(bytes / count) : 0,
+                    kbPerSecond: Math.round(bytes / seconds / 1024),
                     bufferedBytes: this.net.socket?.bufferedAmount || 0,
+                    queuedBytes: this.net.sendStats.queuedBytes,
+                    pendingMessages: this.net.sendStats.pending,
+                    lastStateEncodeMs: this.net.sendStats.lastStateMs || 0,
+                    lastWelcomeBytes: this.net.sendStats.lastWelcomeBytes || 0,
                     hidden: document.hidden || false,
                     entities: this.session.root.entityMgr.entities.size,
                 })
@@ -2212,6 +2261,8 @@ export default class CoopMod extends ModBase {
                 bytes: 0,
                 maxMs: 0,
                 rate: stats.rate,
+                sentBytes: this.net.sendStats.stateBytes,
+                sentCount: this.net.sendStats.stateCount,
             };
         }
         return stats.rate;
@@ -2229,7 +2280,7 @@ export default class CoopMod extends ModBase {
         }
         if (
             !fullSnapshot &&
-            (this.net.socket?.bufferedAmount > 512 * 1024 ||
+            (this.net.transportBusy() ||
                 [...this.stateReceipts].some(
                     ([id, receipt]) => this.slots.has(id) && this.baseline.revision - receipt >= 2
                 ))
@@ -2242,6 +2293,8 @@ export default class CoopMod extends ModBase {
                         revision: this.baseline.revision,
                         receipts: Object.fromEntries(this.stateReceipts),
                         bufferedBytes: this.net.socket?.bufferedAmount || 0,
+                        queuedBytes: this.net.sendStats.queuedBytes,
+                        pendingMessages: this.net.sendStats.pending,
                     })
                 );
             }
@@ -2261,7 +2314,6 @@ export default class CoopMod extends ModBase {
                 this.recordStatePerf("host", {
                     captureMs: captured - started,
                     workMs: performance.now() - started,
-                    bytes: this.net.lastWireBytes || 0,
                 });
                 return fullSnapshot ? captureSnapshot(this.session.root, window.shapez, snapshot) : snapshot;
             }
@@ -2312,7 +2364,6 @@ export default class CoopMod extends ModBase {
             this.net.send({ t: "state-received", to: this.hostId, revision: frame.revision });
         } catch (ex) {
             warn("state apply failed", ex);
-            this.lastResyncRequest = 0;
             this.requestResync();
         } finally {
             this.applyingRemote = false;
@@ -2391,10 +2442,14 @@ export default class CoopMod extends ModBase {
                     message.to === this.net.clientId &&
                     this.slots.has(message.from) &&
                     Number.isSafeInteger(message.revision) &&
+                    message.revision >= 0 &&
                     message.revision <= this.baseline.revision &&
-                    message.revision > (this.stateReceipts.get(message.from) ?? -1)
+                    message.revision >= (this.stateReceipts.get(message.from) ?? -1)
                 ) {
                     this.stateReceipts.set(message.from, message.revision);
+                    const pending = this.pendingWelcomes.get(message.from);
+                    if (pending && message.revision >= pending.revision)
+                        this.pendingWelcomes.delete(message.from);
                 }
                 return;
             case "ping-req":
@@ -2443,6 +2498,7 @@ export default class CoopMod extends ModBase {
                 this.slots.delete(message.from);
                 this.acceptedSeq.delete(message.from);
                 this.stateReceipts.delete(message.from);
+                this.pendingWelcomes.delete(message.from);
                 this.renderPeers();
                 return;
             case "session-full":
@@ -2628,8 +2684,17 @@ export default class CoopMod extends ModBase {
         if (!this.session || !this.session.isHost || !rootReadyForNet(this.session.root)) {
             return;
         }
+        const awaitingSnapshot = id => {
+            const pending = this.pendingWelcomes.get(id);
+            return (
+                this.net.sendStats.welcomes.has(id) ||
+                (pending && Date.now() - pending.at < SNAPSHOT_TIMEOUT_MS)
+            );
+        };
+        if (awaitingSnapshot(to)) return;
+        if (!sharedDump && this.net.transportBusy()) return;
         if (to === "*") {
-            const ids = [...this.slots.keys()].filter(id => this.peers.has(id));
+            const ids = [...this.slots.keys()].filter(id => this.peers.has(id) && !awaitingSnapshot(id));
             if (!ids.length) return;
             const dump = this.broadcastState(true);
             if (dump) for (const id of ids) this.sendWelcome(id, dump);
@@ -2650,15 +2715,19 @@ export default class CoopMod extends ModBase {
             if (!dump) {
                 return; // Retry after backpressure; never mislabel a snapshot's baseline.
             }
-            this.net.send({
-                t: "welcome",
-                to,
-                slot: this.slots.get(to),
-                dump,
-                revision: this.baseline.revision,
-                ack: this.acceptedSeq.get(to) || 0,
-            });
+            if (
+                !this.net.send({
+                    t: "welcome",
+                    to,
+                    slot: this.slots.get(to),
+                    dump,
+                    revision: this.baseline.revision,
+                    ack: this.acceptedSeq.get(to) || 0,
+                })
+            )
+                return;
             this.stateReceipts.set(to, this.baseline.revision);
+            this.pendingWelcomes.set(to, { revision: this.baseline.revision, at: Date.now() });
             log("sent welcome dump to", to, "revision", this.baseline.revision);
         } catch (ex) {
             warn("welcome dump failed", ex);

@@ -68,7 +68,11 @@ test("compact state preserves belt runs, fixed slots and complete processing que
                             { remainingTime: 0.42, items: [{ item: runtimeItem, requiredSlot: 0 }] },
                         ],
                         bonusTime: 0.1,
-                        queuedEjects: [{ item: runtimeItem, preferredSlot: null }],
+                        queuedEjects: [
+                            { item: runtimeItem, preferredSlot: null, doNotTrack: true },
+                            { item: runtimeItem, requiredSlot: 1, doNotTrack: false },
+                            { item: runtimeItem },
+                        ],
                     },
                     ItemAcceptor: {
                         itemConsumptionAnimations: [

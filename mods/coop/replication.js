@@ -177,19 +177,51 @@ function encodeRuntime(value, previous) {
     if (value == null || typeof value !== "object") {
         return value;
     }
-    if (previous && matchesCapture(value, previous)) return previous;
     if (typeof value.getItemType === "function") {
         if (!runtimeItems.has(value)) runtimeItems.set(value, { $item: encodeItem(value) });
         return runtimeItems.get(value);
     }
     if (value instanceof Map) {
-        return { $map: [...value].map(([key, item]) => [key, encodeRuntime(item)]) };
+        const entries = previous?.$map;
+        let result = entries?.length === value.size ? entries : [];
+        let i = 0;
+        for (const [key, item] of value) {
+            const prior = entries?.[i];
+            const encoded = encodeRuntime(item, prior?.[1]);
+            if (!prior || key !== prior[0] || encoded !== prior[1]) {
+                if (result === entries) result = entries.slice();
+                result[i] = [key, encoded];
+            } else if (result !== entries) result[i] = prior;
+            ++i;
+        }
+        return result === entries ? previous : { $map: result };
     }
     if (Array.isArray(value)) {
-        return value.map((item, i) => encodeRuntime(item, previous?.[i]));
+        const prior = Array.isArray(previous) ? previous : null;
+        let result = prior?.length === value.length ? prior : [];
+        for (let i = 0; i < value.length; ++i) {
+            const encoded = encodeRuntime(value[i], prior?.[i]);
+            if (!prior || encoded !== prior[i]) {
+                if (result === prior) result = prior.slice();
+                result[i] = encoded;
+            } else if (result !== prior) result[i] = encoded;
+        }
+        return result;
     }
-    const result = {};
-    for (const key of Object.keys(value)) result[key] = encodeRuntime(value[key], previous?.[key]);
+    const keys = Object.keys(value);
+    const prior = previous && typeof previous === "object" && !Array.isArray(previous) ? previous : null;
+    let result = prior && keys.length === Object.keys(prior).length ? prior : {};
+    for (const key of keys) {
+        const encoded = encodeRuntime(value[key], prior?.[key]);
+        if (!prior || !Object.hasOwn(prior, key) || encoded !== prior[key]) {
+            if (result === prior) result = { ...prior };
+            result[key] = encoded;
+        } else if (result !== prior) result[key] = encoded;
+    }
+    // Equal key counts can hide a removed field and an added field. Detached
+    // captures must carry exactly the current keys, including optional slots.
+    if (result !== prior)
+        for (const key of Object.keys(result)) if (!Object.hasOwn(value, key)) delete result[key];
     return result;
 }
 
@@ -222,6 +254,18 @@ function matchesCapture(value, previous) {
     return true;
 }
 
+function captureItems(values, previous) {
+    let result = previous?.length === values.length ? previous : [];
+    for (let i = 0; i < values.length; ++i) {
+        const item = encodeItem(values[i]);
+        if (item !== previous?.[i]) {
+            if (result === previous) result = previous.slice();
+            result[i] = item;
+        } else if (result !== previous) result[i] = item;
+    }
+    return result;
+}
+
 function captureComponent(id, component, previous) {
     if (id === "ItemProcessor")
         return previous?.nextOutputSlot === component.nextOutputSlot
@@ -229,15 +273,24 @@ function captureComponent(id, component, previous) {
             : { nextOutputSlot: component.nextOutputSlot };
     if (id === "Miner") {
         const lastMiningTime = Math.floor(component.lastMiningTime * 10000) / 10000;
-        const buffer = component.itemChainBuffer;
-        if (
-            previous &&
-            previous.lastMiningTime === lastMiningTime &&
-            previous.itemChainBuffer.length === buffer.length &&
-            buffer.every((item, i) => matchesCapture(encodeItem(item), previous.itemChainBuffer[i]))
-        )
+        const itemChainBuffer = captureItems(component.itemChainBuffer, previous?.itemChainBuffer);
+        if (previous?.lastMiningTime === lastMiningTime && itemChainBuffer === previous.itemChainBuffer)
             return previous;
-        return { lastMiningTime, itemChainBuffer: buffer.map(encodeItem) };
+        return { lastMiningTime, itemChainBuffer };
+    }
+    if (id === "UndergroundBelt") {
+        const values = component.pendingItems;
+        const prior = previous?.pendingItems;
+        let pendingItems = prior?.length === values.length ? prior : [];
+        for (let i = 0; i < values.length; ++i) {
+            const item = encodeItem(values[i][0]);
+            const time = Math.floor(values[i][1] * 10000) / 10000;
+            if (item !== prior?.[i]?.[0] || time !== prior?.[i]?.[1]) {
+                if (pendingItems === prior) pendingItems = prior.slice();
+                pendingItems[i] = [item, time];
+            } else if (pendingItems !== prior) pendingItems[i] = prior[i];
+        }
+        return pendingItems === prior ? previous : { pendingItems };
     }
     if (id !== "ItemEjector" && id !== "WiredPins") return component.serialize();
     // Match the core slot schemas without creating temporary structured objects
@@ -322,14 +375,16 @@ export class StateCapture {
             for (const [id, component, hasSchema] of cached.dynamic) {
                 const fields = RUNTIME_FIELDS[id];
                 const previousRuntime = data.runtime[id];
-                let changedRuntime = false;
+                let runtime = previousRuntime;
                 if (fields)
                     for (const field of fields) {
-                        if (!previousRuntime || !matchesCapture(component[field], previousRuntime[field])) {
-                            changedRuntime = true;
-                            break;
+                        const encoded = encodeRuntime(component[field], previousRuntime?.[field]);
+                        if (!previousRuntime || encoded !== previousRuntime[field]) {
+                            if (runtime === previousRuntime) runtime = { ...previousRuntime };
+                            runtime[field] = encoded;
                         }
                     }
+                const changedRuntime = runtime !== previousRuntime;
                 // Core schemas serialize arrays/objects into fresh containers;
                 // encodeRuntime also copies every mutable container. Reuse
                 // these detached values instead of cloning through JSON again.
@@ -345,15 +400,12 @@ export class StateCapture {
                         data.components[id] = serialized;
                 }
                 if (changedRuntime) {
-                    const runtime = {};
-                    for (const field of fields)
-                        runtime[field] = encodeRuntime(component[field], previousRuntime?.[field]);
                     data.runtime[id] = runtime;
                 }
             }
             cached.data = data;
             if (data !== previous) changed.push(data);
-            capturedEntities.add(data);
+            if (data !== previous) capturedEntities.add(data);
             entities.push(data);
         }
         const beltPaths = root.systemMgr.systems.belt.beltPaths.map(path => {
@@ -436,7 +488,9 @@ export function packStateFrame(frame) {
             itemId(value.item.$item),
             value.requiredSlot ?? null,
             value.preferredSlot ?? null,
-            (Object.hasOwn(value, "requiredSlot") ? 1 : 0) | (Object.hasOwn(value, "preferredSlot") ? 2 : 0),
+            (Object.hasOwn(value, "requiredSlot") ? 1 : 0) |
+                (Object.hasOwn(value, "preferredSlot") ? 2 : 0) |
+                (typeof value.doNotTrack === "boolean" ? 4 | (value.doNotTrack ? 8 : 0) : 0),
         ]);
     function packRuntime(id, value) {
         if (id === "ItemProcessor")
@@ -533,6 +587,7 @@ export function unpackStateFrame(frame) {
             item: { $item: item(id) },
             ...(flags & 1 ? { requiredSlot } : {}),
             ...(flags & 2 ? { preferredSlot } : {}),
+            ...(flags & 4 ? { doNotTrack: !!(flags & 8) } : {}),
         }));
     function unpackRuntime(id, value) {
         if (id === "ItemProcessor")
@@ -641,8 +696,9 @@ function decodeRuntime(value, root, exports, target) {
         return result;
     }
     const result = target && Object.getPrototypeOf(target) === Object.prototype ? target : {};
-    for (const key of Object.keys(result)) if (!Object.hasOwn(value, key)) delete result[key];
-    for (const key of Object.keys(value)) result[key] = decodeRuntime(value[key], root, exports, result[key]);
+    for (const key in result) if (!Object.hasOwn(value, key)) delete result[key];
+    for (const key in value)
+        if (Object.hasOwn(value, key)) result[key] = decodeRuntime(value[key], root, exports, result[key]);
     return result;
 }
 
@@ -738,8 +794,8 @@ function restoreComponents(entity, data, internal, root, exports) {
     // Slot geometry comes from the validated welcome/building, not live frames.
     // These hot schemas contain just items and numeric state; restore directly
     // instead of recursively verifying/rebuilding every unchanged slot field.
-    const remaining = {};
-    for (const [id, value] of Object.entries(data)) {
+    for (const id of Object.keys(data)) {
+        const value = data[id];
         const component = entity.components[id];
         if (id === "ItemEjector" || id === "WiredPins") {
             if (value.slots.length !== component.slots.length)
@@ -756,9 +812,16 @@ function restoreComponents(entity, data, internal, root, exports) {
                         ? exports.itemResolverSingleton(root, slot.value)
                         : null;
             }
-        } else remaining[id] = value;
+        } else if (component) {
+            const error = component.deserialize(value, root);
+            if (error) return error;
+        } else {
+            // Keep the serializer's missing-component diagnostics for modded
+            // entities while avoiding temporary dictionaries in the hot path.
+            const error = internal.deserializeComponents(root, entity, { [id]: value });
+            if (error) return error;
+        }
     }
-    return internal.deserializeComponents(root, entity, remaining);
 }
 
 // Apply the canonical map without placement heuristics seeing half a map.
@@ -769,13 +832,16 @@ export function reconcileWorld(root, baseline, frame, exports, forceFull = false
     // (a reconnect can replace managers or the resolver supplied by another mod).
     const items = new WeakMap();
     const resolve = exports.itemResolverSingleton;
-    exports = {
-        ...exports,
-        itemResolverSingleton(root, data) {
-            if (!items.has(data)) items.set(data, resolve(root, data));
-            return items.get(data);
+    // ModLoader exposes non-enumerable, getter-only exports. Spreading that
+    // namespace drops the serializer constructors in the actual game.
+    exports = Object.create(exports, {
+        itemResolverSingleton: {
+            value(root, data) {
+                if (!items.has(data)) items.set(data, resolve(root, data));
+                return items.get(data);
+            },
         },
-    };
+    });
     const forcedUids = forceFull instanceof Set ? forceFull : null;
     const rollbackBelts = forceFull === true || !!forcedUids?.size;
     forceFull = forceFull === true;
@@ -958,6 +1024,7 @@ export function refreshReplicaCaches(
 
 export function applyCommands(root, ops, exports, slot = null) {
     const internal = new exports.SerializerInternal();
+    let placed = false;
     for (const op of ops) {
         if (op.k === "blueprint") {
             if (!Array.isArray(op.ops) || op.ops.some(child => !["place", "delete"].includes(child.k))) {
@@ -972,13 +1039,14 @@ export function applyCommands(root, ops, exports, slot = null) {
             ) {
                 continue;
             }
-            let placed = false;
+            let blueprintPlaced = false;
             root.logic.performImmutableOperation(() => {
-                placed = applyCommands(root, op.ops, exports, slot);
+                blueprintPlaced = applyCommands(root, op.ops, exports, slot);
             });
-            if (placed && op.cost) {
+            if (blueprintPlaced && op.cost) {
                 root.hubGoals.takeShapeByKey(op.cost.key, op.cost.amount);
             }
+            placed ||= blueprintPlaced;
             continue;
         }
         if (op.k === "place") {
@@ -1002,6 +1070,7 @@ export function applyCommands(root, ops, exports, slot = null) {
             root.map.placeStaticEntity(entity);
             root.entityMgr.registerEntity(entity, op.uid);
             root.entityMgr.nextUid = Math.max(root.entityMgr.nextUid, op.uid + 1);
+            placed = true;
         } else if (op.k === "delete") {
             const entity = root.entityMgr.findByUid(op.uid, false);
             if (entity) {
@@ -1026,5 +1095,5 @@ export function applyCommands(root, ops, exports, slot = null) {
             }
         }
     }
-    return ops.some(op => op.k === "place" && root.entityMgr.findByUid(op.uid, false));
+    return placed;
 }

@@ -1,4 +1,4 @@
-# Co-op mod (0.10.1, protocol v4)
+# Co-op mod (0.10.3, protocol v4)
 
 Experimental 2-player (N-capable) cooperative multiplayer for shapez CE.
 
@@ -20,10 +20,16 @@ Experimental 2-player (N-capable) cooperative multiplayer for shapez CE.
 
 ## Running it
 
-Both sides must run **co-op 0.10.1 and the rebuilt game from this checkout**.
+Both sides must run **co-op 0.10.3 and the rebuilt game from this checkout**.
 Protocol v4 is incompatible with older co-op versions. This change includes
 base-game serializer fixes, so replacing only the mod in an old app is insufficient.
 The co-op version is shown in the panel title.
+
+0.10.3 fixes a production mod-API regression that could make every client state
+application throw and trigger repeated full snapshots. Recovery requests now
+coalesce until acknowledgement or a 15-second timeout, and flow control includes
+queued compression as well as WebSocket buffering. See PERFORMANCE.md for the
+incident evidence and packaged Electron verification.
 
 1. Build both processes (main + renderer). From the repo root:
    `npm i`, then `npm run gulp` in one terminal and `npm start -- --dev --load-mod mods/coop --watch`
