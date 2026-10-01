@@ -1,5 +1,83 @@
 # Co-op performance investigation
 
+## Client UI stalls in 0.10.4 (2026-10-01)
+
+The supplied client log from the next 0.10.3 session shows one successful welcome
+and steady revisions, without the previous application exception/snapshot storm.
+Client state application averages about 7–16 ms, while decode wall time grows
+from 57 ms to 87–173 ms, with combined peaks around 260 ms. The host publishes
+roughly 5–7 updates/second and waits on advancing client receipts; its socket
+backlog stays small. A counter reaching 545 is normal revision progress.
+The client reports that the entire UI stutters, rather than only item animation.
+Decode wall time includes asynchronous waits and does not establish pure CPU
+cost. These older logs do not measure actual canvas/HUD drawing.
+
+Large packets now inflate in a persistent worker, transferring the original
+compact UTF-8 bytes back to the main thread. Expanded objects are not cloned
+across the worker boundary, and the worker does not parse/re-serialize inflated
+JSON. Main-thread compact-state expansion works in batches, targeting 3 ms
+between normal-priority scheduled tasks. Boosted continuation tasks did not
+give ordinary UI timers enough opportunities in the controlled test. Arrays
+with known lengths are allocated once. Inline fallback uses streaming UTF-8
+decoding instead of another Blob read. Packet FIFO order, complete application
+before receipts, recovery guards, corruption checks and disconnect cancellation
+are retained. No simulation or wire-format change is involved.
+
+An initial worker experiment that returned the expanded object graph was
+rejected: at 6x CPU slowdown it increased mean decode time from about 52 ms to
+100 ms and produced 41 long tasks in 40 samples. Raw-byte transfer and cooperative
+expansion address that copying/scheduling cost; merely using a worker was not
+sufficient.
+
+The final comparison loads the exact committed 0.10.3 transport/unpacker from
+`cc4d8473` and the actual packaged 0.10.4 mod in Chromium. It decodes the same
+compressed production-state frame 40 times per mode at up to 10 Hz. The frozen
+save supplies 25,201 valid entities after excluding nine overlapping records
+in memory. At deliberate 6x renderer CPU slowdown, one paired comparison reports:
+
+| Measurement                       | Committed 0.10.3 | 0.10.4 worker | 0.10.4 inline fallback |
+| --------------------------------- | ---------------: | ------------: | ---------------------: |
+| Mean complete decode wall time    |          56.0 ms |       54.5 ms |                70.5 ms |
+| 10 ms UI heartbeat gap, 95th pct. |          44.1 ms |       33.1 ms |                31.9 ms |
+| Maximum UI heartbeat gap          |          99.9 ms |       36.0 ms |                39.7 ms |
+
+This is evidence for shorter UI scheduling stalls, not a large throughput gain.
+Cooperative expansion has overhead; the unavailable-worker fallback takes longer
+overall while keeping UI task gaps shorter. Other trials varied, so the maxima
+are individual observations, not latency guarantees. Drawing/assets are stubbed
+in this fixture: these figures are **not live multiplayer FPS**, GPU timings or
+proof that all of the friend's rendering lag is resolved.
+
+All 48 regressions pass, including actual worker decoding, Unicode/corruption,
+startup/crash/timeout fallback, disposal, recovery skipping and cancellation while
+expanding a long belt. The packaged two-renderer test passes 20 updates with
+matching production state and exactly one replacement welcome after a forced
+missing baseline plus 21 recovery requests.
+
+New five-second `renderer performance` records measure GameCore draw-call rate,
+mean/max canvas/HUD draw duration, maximum frame gap, zoom, canvas dimensions and
+visibility. They measure JavaScript draw calls, including HUD-only calls while
+rendering is paused; they do not measure GPU completion. `state performance`
+adds `wireDecodeMs`, worker main-thread `parseMs`, `unpackMs` elapsed versus
+`unpackWorkMs` active work, and `receiveQueueMs`. Large draw times point to canvas/
+HUD work; short draw times with long gaps point to other renderer tasks. Decode
+elapsed time can also rise because drawing blocks continuation tasks.
+
+Optional reproducible comparison after packaging (PowerShell):
+
+```powershell
+$env:COOP_BENCHMARK_SAVE = 'C:\path\to\savegame.bin'
+$env:COOP_DECODE_PROFILE = '1'
+$env:COOP_DECODE_CPU_RATE = '6' # 1 for no deliberate slowdown
+npm run test:coop:electron
+```
+
+An unresponsive worker falls back after 15 seconds so it cannot indefinitely
+block the receive FIFO and prevent a queued recovery welcome from being read.
+The comparison needs the baseline commit in local Git history. Override it with
+`COOP_DECODE_BASELINE_REF` when testing another reference. Diagnostics stay in
+the test's isolated temporary directory; the supplied save is never written.
+
 ## Live regression and recovery fix in 0.10.3 (2026-10-01)
 
 The 0.10.2 LAN session at 14:41 UTC regressed badly. The host log records

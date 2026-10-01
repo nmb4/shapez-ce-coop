@@ -1,4 +1,4 @@
-# Co-op mod (0.10.3, protocol v4)
+# Co-op mod (0.10.4, protocol v4)
 
 Experimental 2-player (N-capable) cooperative multiplayer for shapez CE.
 
@@ -20,7 +20,7 @@ Experimental 2-player (N-capable) cooperative multiplayer for shapez CE.
 
 ## Running it
 
-Both sides must run **co-op 0.10.3 and the rebuilt game from this checkout**.
+Both sides must run **co-op 0.10.4 and the rebuilt game from this checkout**.
 Protocol v4 is incompatible with older co-op versions. This change includes
 base-game serializer fixes, so replacing only the mod in an old app is insufficient.
 The co-op version is shown in the panel title.
@@ -30,6 +30,12 @@ application throw and trigger repeated full snapshots. Recovery requests now
 coalesce until acknowledgement or a 15-second timeout, and flow control includes
 queued compression as well as WebSocket buffering. See PERFORMANCE.md for the
 incident evidence and packaged Electron verification.
+
+0.10.4 moves large-packet inflation to a persistent worker, transfers compact
+bytes back to the renderer, and expands state in short slices that allow UI
+tasks between them. Packet order and complete-state receipts are preserved.
+Workers fall back to inline decoding if unavailable and stop on disconnect.
+This targets packet processing stalls; it does not establish live client FPS.
 
 1. Build both processes (main + renderer). From the repo root:
    `npm i`, then `npm run gulp` in one terminal and `npm start -- --dev --load-mod mods/coop --watch`
@@ -97,7 +103,10 @@ The sync label includes the received state rate after the first five seconds.
 session approaches 10 updates per second. Logs now include `state performance`
 records every five seconds (rate, capture/apply/decode time, compressed payload
 size and socket buffering), plus `state backpressure` when waiting for a slow
-client. Check logs on both PCs. See [PERFORMANCE.md](PERFORMANCE.md) for the
+client. `renderer performance` now measures canvas/HUD draw calls, draw duration,
+frame gaps, zoom and canvas size separately. State timings distinguish worker
+inflation, main-thread parsing, expansion work versus waits, and receive-queue
+delay. Check logs on both PCs. See [PERFORMANCE.md](PERFORMANCE.md) for the
 investigation and benchmark.
 
 ## Validation

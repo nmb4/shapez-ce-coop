@@ -565,9 +565,7 @@ export function packStateFrame(frame) {
     return packed;
 }
 
-export function unpackStateFrame(frame) {
-    if (!frame.itemTable) return frame;
-    const { itemTable, bp, bu, p, ...rest } = frame;
+function stateUnpacker(itemTable) {
     function item(id) {
         if (id === null) return null;
         if (!Number.isSafeInteger(id) || !itemTable[id]) throw new Error("Unknown state item");
@@ -639,41 +637,107 @@ export function unpackStateFrame(frame) {
                 return unpack(value);
         }
     }
-    function expand(runs) {
-        const values = [];
-        for (const [distance, id, count] of runs) {
+    function* expand(runs) {
+        let length = 0;
+        for (const [, id, count] of runs) {
             if (
                 !itemTable[id] ||
                 !Number.isSafeInteger(count) ||
                 count < 1 ||
                 count > 1000000 ||
-                values.length + count > 1000000
+                length + count > 1000000
             )
                 throw new Error("Invalid belt item run");
-            for (let i = 0; i < count; ++i) values.push([distance, itemTable[id]]);
+            length += count;
+        }
+        const values = new Array(length);
+        let offset = 0;
+        let untilYield = 1024;
+        for (const [distance, id, count] of runs) {
+            for (let i = 0; i < count; ) {
+                const end = i + Math.min(count - i, untilYield);
+                untilYield -= end - i;
+                for (; i < end; ++i) values[offset++] = [distance, itemTable[id]];
+                if (untilYield === 0) {
+                    yield;
+                    untilYield = 1024;
+                }
+            }
         }
         return values;
     }
+    const patch = ([uid, components, runtime]) => ({
+        uid,
+        components: Object.fromEntries(components.map(([id, value]) => [id, unpackComponent(id, value)])),
+        runtime: Object.fromEntries(runtime.map(([id, value]) => [id, unpackRuntime(id, value)])),
+    });
+    return { unpack, patch, expand };
+}
+
+function* unpackStateFrameSteps(frame) {
+    if (!frame.itemTable) return frame;
+    const { itemTable, bp, bu, p, ...rest } = frame;
+    const { unpack, patch, expand } = stateUnpacker(itemTable);
     const result = unpack(rest);
-    if (p)
-        result.patches = p.map(([uid, components, runtime]) => ({
-            uid,
-            components: Object.fromEntries(components.map(([id, value]) => [id, unpackComponent(id, value)])),
-            runtime: Object.fromEntries(runtime.map(([id, value]) => [id, unpackRuntime(id, value)])),
-        }));
-    if (bp)
-        result.beltPaths = bp.map(([entityPath, spacingToFirstItem, runs]) => ({
-            entityPath,
-            spacingToFirstItem,
-            items: expand(runs),
-        }));
-    if (bu)
-        result.beltUpdates = bu.map(([index, spacingToFirstItem, runs]) => ({
-            index,
-            spacingToFirstItem,
-            items: expand(runs),
-        }));
+    if (p) {
+        result.patches = new Array(p.length);
+        for (let i = 0; i < p.length; ++i) {
+            result.patches[i] = patch(p[i]);
+            if ((i + 1) % 64 === 0) yield;
+        }
+    }
+    if (bp) {
+        result.beltPaths = new Array(bp.length);
+        for (let i = 0; i < bp.length; ++i) {
+            const [entityPath, spacingToFirstItem, runs] = bp[i];
+            result.beltPaths[i] = { entityPath, spacingToFirstItem, items: yield* expand(runs) };
+            if ((i + 1) % 4 === 0) yield;
+        }
+    }
+    if (bu) {
+        result.beltUpdates = new Array(bu.length);
+        for (let i = 0; i < bu.length; ++i) {
+            const [index, spacingToFirstItem, runs] = bu[i];
+            result.beltUpdates[i] = { index, spacingToFirstItem, items: yield* expand(runs) };
+            if ((i + 1) % 4 === 0) yield;
+        }
+    }
     return result;
+}
+
+export function unpackStateFrame(frame) {
+    const steps = unpackStateFrameSteps(frame);
+    for (;;) {
+        const result = steps.next();
+        if (result.done) return result.value;
+    }
+}
+
+// Parsing compact production state must not monopolize the UI task. Yields
+// publish nothing: the receive FIFO applies/acknowledges the complete result.
+export async function unpackStateFrameAsync(
+    frame,
+    yieldToUI = () =>
+        globalThis.scheduler?.postTask
+            ? globalThis.scheduler.postTask(() => {})
+            : new Promise(resolve => setTimeout(resolve, 0)),
+    checkActive = () => {},
+    budgetMs = 3
+) {
+    const steps = unpackStateFrameSteps(frame);
+    let start = performance.now();
+    let workMs = 0;
+    for (;;) {
+        checkActive();
+        const result = steps.next();
+        const now = performance.now();
+        if (result.done) return { message: result.value, workMs: workMs + now - start };
+        if (now - start >= budgetMs) {
+            workMs += now - start;
+            await yieldToUI();
+            start = performance.now();
+        }
+    }
 }
 
 function decodeRuntime(value, root, exports, target) {

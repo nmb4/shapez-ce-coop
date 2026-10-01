@@ -6,6 +6,7 @@ import { globalConfig } from "../../src/js/core/config";
 import { gMetaBuildingRegistry } from "../../src/js/core/global_registries";
 import { Vector } from "../../src/js/core/vector";
 import { GameRoot } from "../../src/js/game/root";
+import { GameCore } from "../../src/js/game/core";
 import { GameMode } from "../../src/js/game/game_mode";
 import { BaseMap } from "../../src/js/game/map";
 import { GameLogic } from "../../src/js/game/logic";
@@ -71,6 +72,7 @@ window.shapez = exportGetters({
     SerializerInternal,
     itemResolverSingleton,
     GameMode,
+    GameCore,
     GameLogic,
     GameTime,
     DynamicTickrate,

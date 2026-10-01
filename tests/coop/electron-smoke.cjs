@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const assert = require("node:assert/strict");
-const { spawnSync } = require("node:child_process");
+const { spawnSync, execFileSync } = require("node:child_process");
 const { pathToFileURL } = require("node:url");
 const repo = path.resolve(__dirname, "../..");
 
@@ -22,6 +22,17 @@ const output = fs.mkdtempSync(path.join(os.tmpdir(), "shapez-coop-electron-"));
 const packaged =
     process.env.COOP_ELECTRON_PACKAGE || path.join(repo, "build_output/standalone/shapez-win32-x64");
 const modPath = path.join(packaged, "mods/coop.asar");
+const baselinePath = path.join(output, "decode-reference");
+if (process.env.COOP_DECODE_PROFILE) {
+    // Use the exact committed decoder, not an imitation or the new unpacker.
+    const ref = process.env.COOP_DECODE_BASELINE_REF || "cc4d84731c19df5c0c326df5876dd7abd963f685";
+    fs.mkdirSync(baselinePath);
+    for (const file of ["transport.js", "replication.js"])
+        fs.writeFileSync(
+            path.join(baselinePath, file),
+            execFileSync("git", ["show", ref + ":mods/coop/" + file], { cwd: repo, windowsHide: true })
+        );
+}
 app.setPath("userData", path.join(output, "profile"));
 protocol.registerSchemesAsPrivileged([
     { scheme: "mod", privileges: { standard: true, secure: true, bypassCSP: true, supportFetchAPI: true } },
@@ -67,7 +78,12 @@ app.whenReady()
         assert.ok(fs.existsSync(modPath), "Packaged co-op mod missing; run just rebundle");
         protocol.handle("mod", request => {
             const url = new URL(request.url);
-            const base = url.hostname === "coop" ? modPath : path.join(repo, "tests/coop");
+            const base =
+                url.hostname === "coop"
+                    ? modPath
+                    : url.hostname === "coop-baseline"
+                      ? baselinePath
+                      : path.join(repo, "tests/coop");
             const target = path.resolve(base, "." + url.pathname);
             if (!target.startsWith(base + path.sep)) throw new Error("Invalid fixture path");
             return net.fetch(pathToFileURL(target).href);
@@ -84,11 +100,13 @@ app.whenReady()
         const { CoopWsServer } = require(relayModule);
         const server = new CoopWsServer();
         const counts = {};
+        let lastCompressed;
         server.onMessage = (peer, text) => {
             // Compressed envelopes are counted as transport messages; assertions
             // about state/receipt/recovery use the actual mod state in each renderer.
             const type = text.startsWith("{") ? JSON.parse(text).t : "compressed";
             counts[type] = (counts[type] || 0) + 1;
+            if (type === "compressed") lastCompressed = text;
             server.broadcast(text, peer.id);
         };
         const port = await server.start(0);
@@ -114,7 +132,7 @@ app.whenReady()
                 const message = event.message;
                 fs.appendFileSync(path.join(output, isHost ? "host.log" : "client.log"), message + "\n");
                 if (
-                    /applyState failed|applyWelcome failed|message handling failed|dropping invalid message/.test(
+                    /state apply failed|applyWelcome failed|message handling failed|dropping invalid message/.test(
                         message
                     )
                 )
@@ -155,11 +173,39 @@ app.whenReady()
         }
         assert.equal(counts["resync-request"] || 0, 0, "Healthy state application must not trigger recovery");
         assert.equal(errors.length, 0, errors.join("\n"));
+        if (dump)
+            assert.equal(
+                await client.webContents.executeJavaScript("coopSmoke.mod.net.decoder.mode"),
+                "worker",
+                "The packaged mod decoder must run in an actual Chromium worker"
+            );
         const hostState = await host.webContents.executeJavaScript("coopSmoke.snapshot()");
         const clientState = await client.webContents.executeJavaScript("coopSmoke.snapshot()");
         fs.writeFileSync(path.join(output, "host-state.json"), JSON.stringify(hostState));
         assertReplica(clientState, hostState);
         if (!dump) assert.ok(hostState.hub.storedShapes.CuCuCuCu > 0, "Fixture must actually deliver shapes");
+        let decodeProfile;
+        if (process.env.COOP_DECODE_PROFILE && lastCompressed) {
+            const rate = Number(process.env.COOP_DECODE_CPU_RATE || 1);
+            client.webContents.debugger.attach("1.3");
+            await client.webContents.debugger.sendCommand("Emulation.setCPUThrottlingRate", { rate });
+            try {
+                decodeProfile = [];
+                for (const mode of ["baseline", "inline", "worker"])
+                    decodeProfile.push(
+                        await client.webContents.executeJavaScript(
+                            `import("mod://coop-test/electron-decode-profile.js").then(module => module.profile(${JSON.stringify(lastCompressed)}, ${JSON.stringify(mode)}))`
+                        )
+                    );
+                console.log(
+                    "Renderer decode profile:",
+                    JSON.stringify({ cpuRate: rate, results: decodeProfile })
+                );
+            } finally {
+                await client.webContents.debugger.sendCommand("Emulation.setCPUThrottlingRate", { rate: 1 });
+                client.webContents.debugger.detach();
+            }
+        }
         // Force a missed baseline and burst duplicate recovery requests while a
         // full welcome is pending. Exactly one replacement snapshot should suffice.
         const beforeRecovery = await host.webContents.executeJavaScript("coopSmoke.mod.baseline.revision");
@@ -201,6 +247,7 @@ app.whenReady()
             samples,
             recoveredRevision: hostRevision,
             relayMessages: counts,
+            decodeProfile,
             diagnostics: output,
         };
         fs.writeFileSync(path.join(output, "result.json"), JSON.stringify(result, null, 2));

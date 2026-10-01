@@ -12,9 +12,9 @@ import {
     refreshReplicaCaches,
     restoreAnalytics,
     packStateFrame,
-    unpackStateFrame,
 } from "./replication.js";
-import { decodeWireMessage, encodeWireMessage } from "./transport.js";
+import { encodeWireMessage } from "./transport.js";
+import { WireDecoder } from "./decoder.js";
 
 const ModBase = window.shapez.Mod;
 
@@ -389,6 +389,9 @@ class CoopNet {
         this.socket = socket;
         this.resetTransportStats();
         this.sendChain = Promise.resolve();
+        const decoder = (this.decoder = new WireDecoder({
+            onFallback: reason => warn("background decoder unavailable, using inline decoding", reason),
+        }));
         let receiveChain = Promise.resolve();
         socket.onopen = () => {
             if (this.socket !== socket) {
@@ -408,6 +411,7 @@ class CoopNet {
             }
         };
         socket.onmessage = event => {
+            const receivedAt = performance.now();
             receiveChain = receiveChain
                 .then(async () => {
                     if (this.socket !== socket) {
@@ -416,15 +420,22 @@ class CoopNet {
                     let message;
                     try {
                         const start = performance.now();
-                        message = await decodeWireMessage(event.data);
+                        const decoded = await decoder.decode(event.data, () => this.mod.awaitingWelcome);
+                        message = decoded.message;
                         if (this.socket !== socket) return;
                         if (message.t === "state") {
                             if (this.mod.awaitingWelcome) return;
-                            message = unpackStateFrame(message);
                             message.decodeMs = performance.now() - start;
+                            message.wireDecodeMs = decoded.wireDecodeMs;
+                            message.parseMs = decoded.parseMs;
+                            message.unpackMs = decoded.unpackMs;
+                            message.unpackWorkMs = decoded.unpackWorkMs;
+                            message.receiveQueueMs = start - receivedAt;
+                            message.decodeMode = decoded.mode;
                             message.wireBytes = event.data.length;
                         }
                     } catch (ex) {
+                        if (this.socket !== socket) return;
                         warn("dropping invalid message", ex);
                         if (!this.mod.session?.isHost) this.mod.requestResync();
                         return;
@@ -447,6 +458,7 @@ class CoopNet {
             }
             this.connected = false;
             this.socket = null;
+            decoder.dispose();
             log("disconnected");
             if (this.onClose) {
                 this.onClose();
@@ -460,6 +472,7 @@ class CoopNet {
     }
 
     disconnect() {
+        this.decoder?.dispose();
         if (this.socket) {
             const socket = this.socket;
             this.socket = null;
@@ -1150,8 +1163,22 @@ export default class CoopMod extends ModBase {
         this.net.onOpen = () => this.onSocketOpen();
         this.net.onClose = () => this.onSocketClose();
 
-        // --- Fixed tickrate while a session is active ---------------------
         const mod = this;
+        // Measure the real canvas/HUD draw path separately from async network
+        // waits. A slow decode wall time alone cannot establish rendering FPS.
+        this.modInterface.replaceMethod(shapez("GameCore"), "draw", function (oldFn, args) {
+            if (!mod.session || mod.session.isHost || mod.session.root !== this.root || !mod.net.connected)
+                return oldFn(...args);
+            const started = performance.now();
+            try {
+                return oldFn(...args);
+            } finally {
+                if (this.root && mod.session?.root === this.root)
+                    mod.recordRenderPerf(this.root, performance.now() - started);
+            }
+        });
+
+        // --- Fixed tickrate while a session is active ---------------------
         // A client renders host state, never independently produces or delivers
         // items. Wall-clock pauses/FPS therefore cannot change the shared sim.
         this.modInterface.replaceMethod(shapez("GameTime"), "performTicks", function (oldFn, args) {
@@ -1630,6 +1657,7 @@ export default class CoopMod extends ModBase {
         this.stateReceipts = new Map();
         this.pendingWelcomes = new Map();
         this.perfStats = null;
+        this.renderStats = null;
         this.lastFlowLog = Date.now();
         try {
             ipcRenderer.invoke("coop-active", true).catch(() => {});
@@ -1871,6 +1899,7 @@ export default class CoopMod extends ModBase {
         // Fresh connection, fresh election: a restarted host has a new id.
         this.hostId = this.session.isHost ? this.net.clientId : null;
         this.perfStats = null;
+        this.renderStats = null;
         this.lastResyncRequest = 0;
         this.pendingWelcomes.clear();
         if (!this.session.isHost) {
@@ -2217,6 +2246,11 @@ export default class CoopMod extends ModBase {
                 workMs: 0,
                 captureMs: 0,
                 decodeMs: 0,
+                wireDecodeMs: 0,
+                parseMs: 0,
+                unpackMs: 0,
+                unpackWorkMs: 0,
+                receiveQueueMs: 0,
                 bytes: 0,
                 maxMs: 0,
                 rate: 0,
@@ -2224,7 +2258,18 @@ export default class CoopMod extends ModBase {
                 sentCount: this.net.sendStats.stateCount,
             });
         ++stats.count;
-        for (const key of ["workMs", "captureMs", "decodeMs", "bytes"]) stats[key] += sample[key] || 0;
+        for (const key of [
+            "workMs",
+            "captureMs",
+            "decodeMs",
+            "wireDecodeMs",
+            "parseMs",
+            "unpackMs",
+            "unpackWorkMs",
+            "receiveQueueMs",
+            "bytes",
+        ])
+            stats[key] += sample[key] || 0;
         stats.maxMs = Math.max(stats.maxMs, (sample.workMs || 0) + (sample.decodeMs || 0));
         const seconds = (now - stats.start) / 1000;
         if (seconds >= 5) {
@@ -2240,6 +2285,12 @@ export default class CoopMod extends ModBase {
                     workMs: +(stats.workMs / stats.count).toFixed(2),
                     captureMs: +(stats.captureMs / stats.count).toFixed(2),
                     decodeMs: +(stats.decodeMs / stats.count).toFixed(2),
+                    wireDecodeMs: +(stats.wireDecodeMs / stats.count).toFixed(2),
+                    parseMs: +(stats.parseMs / stats.count).toFixed(2),
+                    unpackMs: +(stats.unpackMs / stats.count).toFixed(2),
+                    unpackWorkMs: +(stats.unpackWorkMs / stats.count).toFixed(2),
+                    receiveQueueMs: +(stats.receiveQueueMs / stats.count).toFixed(2),
+                    decoder: this.net.decoder?.mode || "inline",
                     maxMs: +stats.maxMs.toFixed(2),
                     bytesPerFrame: count ? Math.round(bytes / count) : 0,
                     kbPerSecond: Math.round(bytes / seconds / 1024),
@@ -2258,6 +2309,11 @@ export default class CoopMod extends ModBase {
                 workMs: 0,
                 captureMs: 0,
                 decodeMs: 0,
+                wireDecodeMs: 0,
+                parseMs: 0,
+                unpackMs: 0,
+                unpackWorkMs: 0,
+                receiveQueueMs: 0,
                 bytes: 0,
                 maxMs: 0,
                 rate: stats.rate,
@@ -2266,6 +2322,37 @@ export default class CoopMod extends ModBase {
             };
         }
         return stats.rate;
+    }
+
+    recordRenderPerf(root, drawMs) {
+        const now = performance.now();
+        const stats =
+            this.renderStats ||
+            (this.renderStats = { start: now - drawMs, frames: 0, ms: 0, max: 0, lastFrame: now, maxGap: 0 });
+        stats.maxGap = Math.max(stats.maxGap, now - stats.lastFrame);
+        stats.lastFrame = now;
+        ++stats.frames;
+        stats.ms += drawMs;
+        stats.max = Math.max(stats.max, drawMs);
+        const seconds = (now - stats.start) / 1000;
+        if (seconds < 5) return;
+        log(
+            "renderer performance",
+            JSON.stringify({
+                role: "client",
+                revision: this.baseline.revision,
+                renderHz: +(stats.frames / seconds).toFixed(2),
+                drawMs: +(stats.ms / stats.frames).toFixed(2),
+                maxDrawMs: +stats.max.toFixed(2),
+                maxFrameGapMs: +stats.maxGap.toFixed(2),
+                decoder: this.net.decoder?.mode || "inline",
+                zoom: root.camera?.zoomLevel,
+                canvasWidth: root.canvas?.width,
+                canvasHeight: root.canvas?.height,
+                hidden: document.hidden || false,
+            })
+        );
+        this.renderStats = { start: now, frames: 0, ms: 0, max: 0, lastFrame: now, maxGap: 0 };
     }
 
     broadcastState(fullSnapshot = false) {
@@ -2358,6 +2445,11 @@ export default class CoopMod extends ModBase {
             const rate = this.recordStatePerf("client", {
                 workMs: performance.now() - started,
                 decodeMs: frame.decodeMs || 0,
+                wireDecodeMs: frame.wireDecodeMs || 0,
+                parseMs: frame.parseMs || 0,
+                unpackMs: frame.unpackMs || 0,
+                unpackWorkMs: frame.unpackWorkMs || 0,
+                receiveQueueMs: frame.receiveQueueMs || 0,
                 bytes: frame.wireBytes || 0,
             });
             this.setSync("host state #" + frame.revision + (rate ? " · " + rate.toFixed(1) + " Hz" : ""));

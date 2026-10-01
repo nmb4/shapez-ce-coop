@@ -179,6 +179,15 @@ must never be rebroadcast through local hooks.
     seconds; while awaiting a welcome they wait 15 seconds before retrying.
     Failed application does not reset this cooldown. States received while
     awaiting a welcome are ignored before expanding their compact item tables.
+
+Large packets inflate in a per-connection worker. Only compact UTF-8 bytes
+cross back to the renderer; cloning an expanded item/queue graph causes large
+UI stalls. Main-thread expansion yields between bounded batches with a 3 ms
+work target. The receive FIFO awaits complete expansion and application before
+processing the next packet or acknowledging a revision. Partial frames never
+enter the live world. Disconnect cancels obsolete worker/expansion work, and
+worker failure retries pending packets through the inline decoder once.
+
 -   `sync-check`: structural hash fallback every 15 seconds when no edits are
     pending. Two quiet mismatches (six during building) can request a snapshot,
     with a one-minute automatic drift cooldown.
